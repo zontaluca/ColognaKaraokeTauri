@@ -1,0 +1,73 @@
+:root {
+  /* Background */
+  --bg-primary: #0B1020;
+  --bg-secondary: #121A33;
+  --bg-card: #1A2345;
+  --bg-input: #222B50;
+  --bg-elevated: #2A2F5A;
+
+  /* Primary (warm, actions) */
+  --primary-1: #FF7A18;
+  --primary-2: #FF3D5A;
+  --primary-gradient: linear-gradient(135deg, #FF7A18, #FF3D5A);
+
+  /* Secondary (cool, content) */
+  --secondary-1: #6A5AE0;
+  --secondary-2: #00C2FF;
+  --secondary-gradient: linear-gradient(135deg, #6A5AE0, #00C2FF);
+
+  /* Accents */
+  --accent-yellow: #FFC542;
+  --accent-pink: #FF4D9D;
+  --accent-blue: #4D9DFF;
+  --decorative-gradient: linear-gradient(90deg, #FF4D9D, #4D9DFF);
+
+  /* Card gradient */
+  --card-gradient: linear-gradient(135deg, #2A2F5A, #1A2345);
+
+  /* Text */
+  --text-primary: #FFFFFF;
+  --text-secondary: #B8C0E0;
+  --text-muted: #6B7399;
+
+  /* Feedback */
+  --success: #4ADE80;
+  --warning: #FFC542;
+  --error: #FF4D6B;
+
+  /* Spacing */
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+
+  /* Radius */
+  --radius-sm: 12px;
+  --radius-md: 20px;
+  --radius-lg: 28px;
+  --radius-xl: 36px;
+  --radius-pill: 999px;
+
+  /* Typography */
+  --font-sans: 'Poppins', 'Nunito', system-ui, -apple-system, Segoe UI, sans-serif;
+  --font-xl: 28px;
+  --font-lg: 20px;
+  --font-md: 16px;
+  --font-sm: 14px;
+  --font-xs: 12px;
+
+  --weight-bold: 700;
+  --weight-medium: 500;
+  --weight-regular: 400;
+
+  /* Motion */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 0.15s;
+  --dur-base: 0.22s;
+
+  /* Shadows (sparingly used) */
+  --glow-primary: 0 10px 30px rgba(255, 61, 90, 0.25);
+  --glow-secondary: 0 10px 30px rgba(0, 194, 255, 0.18);
+}

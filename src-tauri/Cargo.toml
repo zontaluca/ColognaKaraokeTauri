@@ -1,0 +1,38 @@
+[package]
+name = "cologna-karaoke"
+version = "0.1.0"
+description = "Cologna Karaoke — Tauri 2 + React"
+authors = ["Luca Zonta"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "cologna_karaoke_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.1", features = ["protocol-asset"] }
+tauri-plugin-shell = "2.0"
+tauri-plugin-dialog = "2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+anyhow = "1"
+regex = "1"
+once_cell = "1"
+hound = "3.5"
+rubato = "0.15"
+cpal = "0.15"
+pitch-detection = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "default capability",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:event:default",
+    "core:path:default",
+    "core:app:default",
+    "core:resources:default",
+    "core:menu:default",
+    "core:tray:default",
+    "dialog:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        { "name": "binaries/yt-dlp", "sidecar": true, "args": true },
+        { "name": "binaries/demucs", "sidecar": true, "args": true },
+        { "name": "binaries/aligner", "sidecar": true, "args": true }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+node_modules
+dist
+dist-ssr
+.DS_Store
+.env
+.env.local
+
+# Tauri
+src-tauri/target
+src-tauri/gen
+src-tauri/Cargo.lock
+
+# IDE
+.idea
+.vscode
+*.log
+*.venv
+build
+src-tauri/binaries
