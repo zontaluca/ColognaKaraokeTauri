@@ -42,7 +42,7 @@
     "externalBin": [
       "binaries/yt-dlp",
       "binaries/demucs",
-      "binaries/aligner"
+      "binaries/whisper-apr"
     ],
     "macOS": {
       "minimumSystemVersion": "10.15",

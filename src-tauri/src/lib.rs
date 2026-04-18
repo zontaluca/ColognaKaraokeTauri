@@ -9,7 +9,9 @@ mod metadata;
 mod pipeline;
 mod pitch;
 mod recorder;
+mod recognizer;
 mod separator;
+mod settings;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,7 +26,12 @@ pub fn run() {
             lyrics::fetch_lyrics_cmd,
             lyrics::parse_lrc_cmd,
             pipeline::process_youtube_url,
+            pipeline::reprocess_song,
             aligner::get_words,
+            aligner::get_cookie_browser,
+            aligner::set_cookie_browser,
+            aligner::get_cookies_file,
+            aligner::set_cookies_file,
             jobs::jobs_enqueue,
             jobs::jobs_list,
             jobs::jobs_cancel,

@@ -6,6 +6,7 @@ import Library from "./views/Library.jsx";
 import Download from "./views/Download.jsx";
 import Player from "./views/Player.jsx";
 import Leaderboard from "./views/Leaderboard.jsx";
+import Settings from "./views/Settings.jsx";
 import { JobsProvider, JobsToast } from "./jobsContext.jsx";
 import Background from "./components/Background.jsx";
 
@@ -39,16 +40,30 @@ export default function App() {
 
   const onJobDone = useCallback(() => { refreshLibrary(); }, [refreshLibrary]);
 
+  const refreshCurrentSong = useCallback(async () => {
+    try {
+      const list = await invoke("scan_library");
+      setSongs(list);
+      if (currentSong) {
+        const updated = list.find((s) => s._dir === currentSong._dir);
+        if (updated) setCurrentSong(updated);
+      }
+    } catch (e) {
+      console.error("refreshCurrentSong failed", e);
+    }
+  }, [currentSong]);
+
   return (
     <JobsProvider onJobDone={onJobDone}>
       <Background view={view} />
       <div className="app">
         <Sidebar view={view} onView={setView} />
         <main className="main">
-          {view === "library" && <Library songs={songs} onPlay={playSong} onDelete={deleteSong} onRefresh={refreshLibrary} />}
+          {view === "library" && <Library songs={songs} onPlay={playSong} onDelete={deleteSong} onRefresh={refreshLibrary} onAddSong={() => setView("download")} />}
           {view === "download" && <Download />}
-          {view === "player" && <Player song={currentSong} />}
+          {view === "player" && <Player song={currentSong} onSongRefreshed={refreshCurrentSong} />}
           {view === "leaderboard" && <Leaderboard songs={songs} />}
+          {view === "settings" && <Settings />}
         </main>
       </div>
       <JobsToast />

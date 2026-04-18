@@ -30,6 +30,10 @@ cpal = "0.15"
 pitch-detection = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
+chfft = "0.3"
+byteorder = "1"
+crc32fast = "1"
+base64 = "0.22"
 parking_lot = "0.12"
 symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
 
