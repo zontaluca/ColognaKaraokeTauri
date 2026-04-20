@@ -37,6 +37,11 @@ base64 = "0.22"
 parking_lot = "0.12"
 symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
 
+aligner-pipeline = { path = "../crates/aligner-pipeline" }
+aligner-whisper = { path = "../crates/aligner-whisper" }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Enable Metal GPU for Whisper inference on Apple Silicon.
+metal = ["aligner-whisper/metal"]

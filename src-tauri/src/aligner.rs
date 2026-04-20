@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use aligner_pipeline::{AlignedWord, AudioBuffer};
+use aligner_whisper::{AlignmentConfig, ForcedAligner, WhisperModel};
 use serde_json::{json, Value};
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
@@ -505,6 +507,149 @@ fn build_words_from_lrc_and_whisper(
     Ok(words)
 }
 
+// ─── Pure-Rust forced alignment ──────────────────────────────────────────────
+
+fn load_wav_mono_16k(path: &Path) -> Result<AudioBuffer, String> {
+    let reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    let src_rate = spec.sample_rate;
+
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => {
+            reader.into_samples::<f32>().filter_map(|s| s.ok()).collect()
+        }
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample as i32;
+            let max = (1i64 << (bits - 1)) as f32;
+            reader
+                .into_samples::<i32>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / max)
+                .collect()
+        }
+    };
+
+    let mono: Vec<f32> = if channels <= 1 {
+        raw
+    } else {
+        raw.chunks(channels)
+            .map(|c| c.iter().sum::<f32>() / channels as f32)
+            .collect()
+    };
+
+    let samples = if src_rate == 16_000 {
+        mono
+    } else {
+        use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+        let params = SincInterpolationParameters {
+            sinc_len: 128,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 128,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let ratio = 16_000.0 / src_rate as f64;
+        let mut resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, mono.len(), 1)
+            .map_err(|e| e.to_string())?;
+        let out = resampler.process(&[mono], None).map_err(|e| e.to_string())?;
+        out.into_iter().next().ok_or("resample produced no output")?
+    };
+
+    Ok(AudioBuffer { samples, sample_rate: 16_000 })
+}
+
+/// Map `AlignedWord` list back to LRC lines and build `WordEntry` list.
+fn aligned_to_word_entries(
+    aligned: &[AlignedWord],
+    lrc_lines: &[crate::lyrics::LrcLine],
+) -> Vec<WordEntry> {
+    if aligned.is_empty() || lrc_lines.is_empty() {
+        return vec![];
+    }
+
+    // Build a flat list of (word_index, line_index) from LRC.
+    let mut line_for_word: Vec<usize> = Vec::with_capacity(aligned.len());
+    for (li, line) in lrc_lines.iter().enumerate() {
+        for _ in line.text.split_whitespace() {
+            line_for_word.push(li);
+        }
+    }
+
+    aligned
+        .iter()
+        .enumerate()
+        .map(|(i, aw)| WordEntry {
+            word: aw.word.clone(),
+            start_ms: (aw.start * 1000.0).round() as u64,
+            end_ms: (aw.end * 1000.0).round() as u64,
+            line: line_for_word.get(i).copied(),
+        })
+        .collect()
+}
+
+/// Run the pure-Rust forced aligner. Returns None if vocals don't exist or on error.
+async fn try_forced_alignment(
+    dir: &Path,
+    lrc_text: &str,
+) -> Option<Vec<WordEntry>> {
+    let vocals_path = dir.join("vocals.wav");
+    if !vocals_path.exists() {
+        return None;
+    }
+
+    let vocals = match load_wav_mono_16k(&vocals_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[aligner/forced] WAV load failed: {}", e);
+            return None;
+        }
+    };
+
+    let lrc_lines = crate::lyrics::parse_lrc(lrc_text);
+    let lyrics: String = lrc_lines
+        .iter()
+        .filter(|l| !l.text.trim().is_empty())
+        .map(|l| l.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if lyrics.split_whitespace().count() == 0 {
+        return None;
+    }
+
+    let language = detect_lrc_language(lrc_text)
+        .unwrap_or("it")
+        .to_string();
+
+    let model = if cfg!(feature = "metal") { WhisperModel::Medium } else { WhisperModel::Small };
+    let config = AlignmentConfig { model, language, ..Default::default() };
+
+    let aligner = match ForcedAligner::new(config).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[aligner/forced] model load failed: {}", e);
+            return None;
+        }
+    };
+
+    match aligner.align(&vocals, &lyrics) {
+        Ok(aligned) => {
+            let words = aligned_to_word_entries(&aligned, &lrc_lines);
+            if words.is_empty() {
+                None
+            } else {
+                eprintln!("[aligner/forced] aligned {} words", words.len());
+                Some(words)
+            }
+        }
+        Err(e) => {
+            eprintln!("[aligner/forced] align failed: {}", e);
+            None
+        }
+    }
+}
+
 fn write_words_json(dir: &Path, words: &[WordEntry]) -> Result<Value, String> {
     let arr: Vec<Value> = words.iter().map(|w| w.to_json()).collect();
     let path = dir.join("words.json");
@@ -538,6 +683,12 @@ pub async fn run_alignment(
     if let Some(lrc_text) = lrc.filter(|t| t.contains('[')) {
         let lang = detect_lrc_language(lrc_text);
         eprintln!("[aligner] detected LRC language: {:?}", lang);
+
+        // Try the pure-Rust forced aligner first; fall back to whisper-apr sidecar.
+        if let Some(words) = try_forced_alignment(dir, lrc_text).await {
+            return write_words_json(dir, &words);
+        }
+        eprintln!("[aligner] forced alignment unavailable, falling back to whisper-apr");
 
         let words = if vad.total_vocal_ms() > 5000 {
             match run_whisper(app, dir, lang).await {
