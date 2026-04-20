@@ -6,11 +6,12 @@ use tauri::AppHandle;
 use crate::aligner::run_alignment;
 use crate::downloader::download_audio;
 use crate::library::{ensure_library, library_dir, save_metadata, song_dir};
-use crate::lyrics::{fetch_lyrics, parse_lrc, shift_lrc};
+use crate::lyrics::fetch_lyrics;
 use crate::metadata::fetch_album_meta;
 use crate::pitch::precompute_reference_pitch;
 use crate::recognizer::recognize_song;
 use crate::separator::separate_vocals;
+use crate::vad;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StageUpdate {
@@ -124,6 +125,17 @@ where
     let _ = std::fs::rename(&download.audio_path, &final_original);
     let _ = std::fs::remove_dir_all(&temp_dir);
 
+    // Step 3.5 — vocal activity detection (best-effort; aligner will recompute if needed)
+    on_progress(3, "active", "Detecting vocal activity...", 0.77);
+    match vad::load_or_compute(&final_song_dir) {
+        Ok(iv) => eprintln!(
+            "[pipeline] VAD: {} regions, total_vocal_ms={}",
+            iv.regions.len(),
+            iv.total_vocal_ms()
+        ),
+        Err(e) => eprintln!("[pipeline] VAD failed (non-fatal): {}", e),
+    }
+
     // Step 4 — align words (mandatory)
     on_progress(4, "active", "Aligning words...", 0.78);
     let lrc_for_align = lrc.clone();
@@ -135,30 +147,6 @@ where
             return Err(e.clone());
         }
     }
-
-    // Correct LRC timing using vocal onset from aligner (fixes video intro offset)
-    let lrc = lrc.and_then(|lrc_text| {
-        // Only shift synced LRC (plain lyrics have no timestamps)
-        if !lrc_text.contains('[') {
-            return Some(lrc_text);
-        }
-        let words_val = words_result.as_ref().ok()?;
-        let first_vocal_ms = words_val.as_array()?.first()?["start_ms"].as_u64()?;
-        let lrc_lines = parse_lrc(&lrc_text);
-        let first_lrc_ms = lrc_lines.first()?.ts_ms;
-        let offset_ms = first_vocal_ms as i64 - first_lrc_ms as i64;
-        // Only shift LRC forward (positive): video has a longer intro than the LRC expects.
-        // A negative offset means whisper reported t≈0 for hallucinated intro segments — never shift backward.
-        if offset_ms > 3000 {
-            eprintln!(
-                "[pipeline] LRC offset correction: +{}ms (vocal_onset={}ms, first_lrc={}ms)",
-                offset_ms, first_vocal_ms, first_lrc_ms
-            );
-            Some(shift_lrc(&lrc_text, offset_ms))
-        } else {
-            Some(lrc_text)
-        }
-    });
 
     // Step 5 — pitch contour (non-fatal)
     on_progress(5, "active", "Computing pitch...", 0.90);
@@ -244,6 +232,17 @@ where
         on_progress(3, "done", "Vocals already separated", 0.22);
     }
 
+    // Step 3.5 — invalidate VAD cache so it recomputes alongside re-alignment
+    let _ = std::fs::remove_file(dir.join("vad.json"));
+    match vad::load_or_compute(&dir) {
+        Ok(iv) => eprintln!(
+            "[reprocess] VAD: {} regions, total_vocal_ms={}",
+            iv.regions.len(),
+            iv.total_vocal_ms()
+        ),
+        Err(e) => eprintln!("[reprocess] VAD failed (non-fatal): {}", e),
+    }
+
     // Step 4 — delete words.json, re-align
     let _ = std::fs::remove_file(dir.join("words.json"));
     on_progress(4, "active", "Aligning words...", 0.76);
@@ -253,22 +252,6 @@ where
         Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
         Err(e) => { on_progress(4, "error", e, 0.0); return Err(e.clone()); }
     }
-
-    // Correct LRC timing using vocal onset
-    let lrc = lrc.and_then(|lrc_text| {
-        if !lrc_text.contains('[') { return Some(lrc_text); }
-        let words_val = words_result.as_ref().ok()?;
-        let first_vocal_ms = words_val.as_array()?.first()?["start_ms"].as_u64()?;
-        let lrc_lines = parse_lrc(&lrc_text);
-        let first_lrc_ms = lrc_lines.first()?.ts_ms;
-        let offset_ms = first_vocal_ms as i64 - first_lrc_ms as i64;
-        if offset_ms > 3000 {
-            eprintln!("[reprocess] LRC offset correction: +{}ms", offset_ms);
-            Some(shift_lrc(&lrc_text, offset_ms))
-        } else {
-            Some(lrc_text)
-        }
-    });
 
     // Step 5 — pitch (force recompute)
     let _ = std::fs::remove_file(dir.join("pitch.json"));

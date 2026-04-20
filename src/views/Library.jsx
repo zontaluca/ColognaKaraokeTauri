@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 const CK_GRADIENT = "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)";
 
@@ -75,9 +76,11 @@ function FeaturedHero({ song, onPlay }) {
   );
 }
 
-function TrackCard({ song, onPlay, onDelete }) {
+function TrackCard({ song, onPlay, onDelete, onReprocess }) {
   const [hovered, setHovered] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [reprocessing, setReprocessing] = useState(false);
+  const [reprocessMsg, setReprocessMsg] = useState("");
   const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
   const bg = coverSrc ? `url(${coverSrc}) center/cover no-repeat` : coverGradient(song._dir || "x");
 
@@ -89,6 +92,29 @@ function TrackCard({ song, onPlay, onDelete }) {
       onDelete(song._dir);
     } catch (err) {
       console.error("delete_song failed", err);
+    }
+  };
+
+  const handleReprocess = async (e) => {
+    e.stopPropagation();
+    if (reprocessing) return;
+    setReprocessing(true);
+    setReprocessMsg("Starting…");
+    let unlisten;
+    try {
+      unlisten = await listen("karaoke://reprocess-progress", (ev) => {
+        const { message, status } = ev.payload || {};
+        if (status === "error") setReprocessMsg("Error: " + message);
+        else setReprocessMsg(message || "");
+      });
+      await invoke("reprocess_song", { dir: song._dir });
+      setReprocessMsg("Done!");
+      await onReprocess?.(song._dir);
+    } catch (err) {
+      setReprocessMsg("Error: " + err);
+    } finally {
+      unlisten?.();
+      setTimeout(() => { setReprocessing(false); setReprocessMsg(""); }, 1500);
     }
   };
 
@@ -150,21 +176,42 @@ function TrackCard({ song, onPlay, onDelete }) {
         <div style={{ marginTop: 4, fontSize: 12, color: "rgba(237,233,255,0.55)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {song.artist || "Unknown"}
         </div>
-        {/* Delete */}
-        <button
-          onClick={handleDelete}
-          onBlur={() => setConfirming(false)}
-          style={{
-            all: "unset", cursor: "pointer", marginTop: 10,
-            fontSize: 11, padding: "4px 10px", borderRadius: 6,
-            background: confirming ? "rgba(242,61,109,0.2)" : "rgba(255,255,255,0.04)",
-            color: confirming ? "#F23D6D" : "rgba(237,233,255,0.45)",
-            border: confirming ? "1px solid rgba(242,61,109,0.3)" : "1px solid rgba(255,255,255,0.06)",
-            transition: "all 140ms",
-          }}
-        >
-          {confirming ? "Confirm?" : "Delete"}
-        </button>
+        {/* Actions */}
+        <div style={{ display: "flex", gap: 6, marginTop: 10, alignItems: "center" }}>
+          <button
+            onClick={handleDelete}
+            onBlur={() => setConfirming(false)}
+            style={{
+              all: "unset", cursor: "pointer",
+              fontSize: 11, padding: "4px 10px", borderRadius: 6,
+              background: confirming ? "rgba(242,61,109,0.2)" : "rgba(255,255,255,0.04)",
+              color: confirming ? "#F23D6D" : "rgba(237,233,255,0.45)",
+              border: confirming ? "1px solid rgba(242,61,109,0.3)" : "1px solid rgba(255,255,255,0.06)",
+              transition: "all 140ms",
+            }}
+          >
+            {confirming ? "Confirm?" : "Delete"}
+          </button>
+          {reprocessing ? (
+            <span style={{ fontSize: 10.5, color: "rgba(237,233,255,0.55)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+              {reprocessMsg}
+            </span>
+          ) : (
+            <button
+              onClick={handleReprocess}
+              title="Re-process lyrics & alignment"
+              style={{
+                all: "unset", cursor: "pointer",
+                fontSize: 11, padding: "4px 10px", borderRadius: 6,
+                background: "rgba(255,255,255,0.04)",
+                color: "rgba(237,233,255,0.45)",
+                border: "1px solid rgba(255,255,255,0.06)",
+              }}
+            >
+              ↻ Re-process
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -207,7 +254,7 @@ const FILTERS = [
   { id: "recent", label: "Recently added" },
 ];
 
-export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong }) {
+export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong, onReprocess }) {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("all");
 
@@ -294,7 +341,7 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong 
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 18 }}>
           {filtered.map(s => (
-            <TrackCard key={s._dir} song={s} onPlay={onPlay} onDelete={onDelete}/>
+            <TrackCard key={s._dir} song={s} onPlay={onPlay} onDelete={onDelete} onReprocess={onReprocess}/>
           ))}
           <AddTrackCard onAdd={onAddSong}/>
         </div>

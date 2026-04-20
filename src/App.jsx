@@ -59,9 +59,9 @@ export default function App() {
       <div className="app">
         <Sidebar view={view} onView={setView} />
         <main className="main">
-          {view === "library" && <Library songs={songs} onPlay={playSong} onDelete={deleteSong} onRefresh={refreshLibrary} onAddSong={() => setView("download")} />}
+          {view === "library" && <Library songs={songs} onPlay={playSong} onDelete={deleteSong} onRefresh={refreshLibrary} onAddSong={() => setView("download")} onReprocess={refreshCurrentSong}/>}
           {view === "download" && <Download />}
-          {view === "player" && <Player song={currentSong} onSongRefreshed={refreshCurrentSong} />}
+          {view === "player" && <Player song={currentSong} />}
           {view === "leaderboard" && <Leaderboard songs={songs} />}
           {view === "settings" && <Settings />}
         </main>

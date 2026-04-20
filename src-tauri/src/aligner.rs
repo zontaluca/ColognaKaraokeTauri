@@ -1,93 +1,234 @@
 use std::path::{Path, PathBuf};
 
+use serde_json::{json, Value};
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
-/// Convert whisper-apr TranscriptionResult JSON segments → [{word, start_ms, end_ms}].
-/// Handles both per-word segments (when --split-on-word used) and multi-word segments
-/// (interpolates timing proportionally by character count).
-fn transcription_to_words(result: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+use crate::vad::VocalIntervals;
+
+const PER_LINE_SHIFT_MIN_MS: u64 = 1500;
+
+#[derive(Debug, Clone)]
+struct WordEntry {
+    word: String,
+    start_ms: u64,
+    end_ms: u64,
+    line: Option<usize>,
+}
+
+impl WordEntry {
+    fn to_json(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("word".into(), Value::String(self.word.clone()));
+        obj.insert("start_ms".into(), json!(self.start_ms));
+        obj.insert("end_ms".into(), json!(self.end_ms));
+        if let Some(l) = self.line {
+            obj.insert("line".into(), json!(l));
+        }
+        Value::Object(obj)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WhisperSegment {
+    text: String,
+    start_ms: u64,
+    end_ms: u64,
+    tokens_lower: Vec<String>,
+}
+
+/// Detect language of LRC text by counting stopword hits. Returns ISO-639-1 code
+/// or `None` if no strong signal (caller should use `auto`).
+fn detect_lrc_language(lrc: &str) -> Option<&'static str> {
+    let stopwords: &[(&str, &[&str])] = &[
+        ("it", &["il", "la", "di", "che", "è", "e", "un", "una", "non", "per", "lo", "le", "dei", "gli", "con", "mi", "ti", "ci", "si", "ma", "come", "sono", "ha", "mia", "suo", "sua", "però", "così", "più", "giorno", "mare", "nome"]),
+        ("en", &["the", "and", "of", "to", "in", "is", "you", "that", "it", "was", "for", "on", "are", "with", "as", "at", "be", "this", "have", "from", "or", "but", "we", "they", "will", "my", "your", "his", "her"]),
+        ("es", &["el", "la", "de", "que", "y", "en", "un", "una", "ser", "se", "no", "por", "con", "su", "para", "como", "está", "tiene", "es", "pero", "más", "todo", "mi"]),
+        ("fr", &["le", "la", "les", "de", "un", "une", "et", "est", "en", "que", "dans", "pour", "sur", "pas", "il", "elle", "je", "tu", "nous", "vous", "mais", "qui", "où"]),
+        ("pt", &["o", "a", "de", "que", "e", "do", "da", "em", "um", "uma", "para", "é", "com", "não", "os", "as", "se", "por", "mais", "mas"]),
+        ("de", &["der", "die", "das", "und", "ist", "in", "zu", "ein", "eine", "nicht", "mit", "sich", "auf", "auch", "es", "an", "als", "bei", "ich", "du", "er", "sie"]),
+    ];
+
+    let normalized: String = lrc
+        .chars()
+        .map(|c| if c.is_alphabetic() || c.is_whitespace() { c.to_ascii_lowercase() } else { ' ' })
+        .collect();
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if tokens.len() < 5 {
+        return None;
+    }
+
+    let mut best: Option<(&'static str, usize)> = None;
+    for (lang, words) in stopwords {
+        let set: std::collections::HashSet<&&str> = words.iter().collect();
+        let hits = tokens.iter().filter(|t| set.contains(t)).count();
+        if best.map_or(true, |(_, h)| hits > h) {
+            best = Some((lang, hits));
+        }
+    }
+    best.filter(|(_, h)| *h >= 3).map(|(l, _)| l)
+}
+
+fn vowel_count(word: &str) -> usize {
+    word.chars()
+        .filter(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'à' | 'è' | 'é' | 'ì' | 'ò' | 'ù'))
+        .count()
+        .max(1)
+}
+
+fn clean_token(raw: &str) -> String {
+    raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-')
+        .to_string()
+}
+
+fn letters_only_lower(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Parse whisper-apr segments into WhisperSegment list (drops tag-only segments like [Music]).
+fn parse_whisper_segments(result: &Value) -> Result<Vec<WhisperSegment>, String> {
     let segments = result["segments"]
         .as_array()
         .ok_or("missing segments in whisper-apr output")?;
 
-    let mut words: Vec<serde_json::Value> = Vec::new();
+    let mut out: Vec<WhisperSegment> = Vec::new();
     for seg in segments {
         let text = seg["text"].as_str().unwrap_or("").trim().to_string();
         if text.is_empty() {
             continue;
         }
-        // Skip whisper hallucination segments: "[Music]", "[BLANK_AUDIO]", etc.
-        if text.starts_with('[') && text.ends_with(']') {
+        // Skip bracketed-tag-only segments (e.g. "[Music]", "[Musica]", "(singing...)")
+        let stripped: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if stripped.starts_with('[') && stripped.ends_with(']') {
+            continue;
+        }
+        if stripped.starts_with('(') && stripped.ends_with(')') {
             continue;
         }
         let start_s = seg["start"].as_f64().unwrap_or(0.0);
         let end_s = seg["end"].as_f64().unwrap_or(start_s);
-        let duration = (end_s - start_s).max(0.0);
+        if end_s <= start_s {
+            continue;
+        }
+        let tokens_lower: Vec<String> = text
+            .split_whitespace()
+            .map(letters_only_lower)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if tokens_lower.is_empty() {
+            continue;
+        }
+        out.push(WhisperSegment {
+            text,
+            start_ms: (start_s * 1000.0) as u64,
+            end_ms: (end_s * 1000.0) as u64,
+            tokens_lower,
+        });
+    }
+    if out.is_empty() {
+        return Err("whisper-apr produced no usable segments".into());
+    }
+    Ok(out)
+}
 
-        let tokens: Vec<&str> = text.split_whitespace().collect();
+/// Distribute words within a line time window by vowel count weight.
+fn distribute_words_in_line(
+    tokens: &[&str],
+    line_idx: usize,
+    start_ms: u64,
+    end_ms: u64,
+    out: &mut Vec<WordEntry>,
+) {
+    if tokens.is_empty() || end_ms <= start_ms {
+        return;
+    }
+    let weights: Vec<f64> = tokens.iter().map(|w| vowel_count(w) as f64).collect();
+    let total_w: f64 = weights.iter().sum::<f64>().max(1.0);
+    let dur_ms = (end_ms - start_ms) as f64;
+
+    let mut t = start_ms as f64;
+    for (i, w) in tokens.iter().enumerate() {
+        let word_dur = dur_ms * (weights[i] / total_w);
+        let ws = t;
+        let we = if i == tokens.len() - 1 { end_ms as f64 } else { t + word_dur };
+        t = we;
+        let clean = clean_token(w);
+        if clean.is_empty() {
+            continue;
+        }
+        out.push(WordEntry {
+            word: clean,
+            start_ms: ws.round() as u64,
+            end_ms: we.round() as u64,
+            line: Some(line_idx),
+        });
+    }
+}
+
+/// Whisper-only alignment (no LRC): emit words distributed within each segment.
+fn whisper_only_words(segments: &[WhisperSegment]) -> Result<Vec<WordEntry>, String> {
+    let mut words: Vec<WordEntry> = Vec::new();
+    for seg in segments {
+        let tokens: Vec<&str> = seg.text.split_whitespace().collect();
         if tokens.is_empty() {
             continue;
         }
-
-        let total_chars: usize = tokens.iter().map(|w| w.len()).sum::<usize>().max(1);
-        let mut t = start_s;
-
-        for w in &tokens {
-            let word_duration = duration * (w.len() as f64 / total_chars as f64);
+        let weights: Vec<f64> = tokens.iter().map(|w| vowel_count(w) as f64).collect();
+        let total_w: f64 = weights.iter().sum::<f64>().max(1.0);
+        let dur_ms = (seg.end_ms - seg.start_ms) as f64;
+        let mut t = seg.start_ms as f64;
+        for (i, w) in tokens.iter().enumerate() {
+            let word_dur = dur_ms * (weights[i] / total_w);
             let ws = t;
-            let we = t + word_duration;
+            let we = if i == tokens.len() - 1 { seg.end_ms as f64 } else { t + word_dur };
             t = we;
-            // Strip leading/trailing punctuation but keep apostrophes and hyphens
-            let clean: String = w
-                .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-')
-                .to_string();
+            let clean = clean_token(w);
             if clean.is_empty() {
                 continue;
             }
-            words.push(serde_json::json!({
-                "word": clean,
-                "start_ms": (ws * 1000.0) as u64,
-                "end_ms": (we * 1000.0) as u64,
-            }));
+            words.push(WordEntry {
+                word: clean,
+                start_ms: ws.round() as u64,
+                end_ms: we.round() as u64,
+                line: None,
+            });
         }
     }
-
     if words.is_empty() {
         return Err("whisper-apr produced no words".into());
     }
     Ok(words)
 }
 
-/// Run word-level alignment via whisper-apr Rust sidecar (pure Rust, no Python required).
-/// Uses base model. On first run, the model is downloaded automatically (~150 MB).
-async fn run_alignment_rust(
+async fn run_whisper(
     app: &AppHandle,
     dir: &Path,
-) -> Result<serde_json::Value, String> {
+    language: Option<&str>,
+) -> Result<Value, String> {
     let vocals_path = dir.join("vocals.wav");
-    let words_path = dir.join("words.json");
-
-    if words_path.exists() {
-        let s = std::fs::read_to_string(&words_path).map_err(|e| e.to_string())?;
-        return serde_json::from_str(&s).map_err(|e| e.to_string());
-    }
-
     if !vocals_path.exists() {
         return Err("vocals.wav not found — re-process song to generate it".into());
     }
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "transcribe".into(),
         "-f".into(),
         vocals_path.to_string_lossy().into_owned(),
         "--model".into(),
         "small".into(),
         "--split-on-word".into(),
+        "--word-timestamps".into(),
         "--no-prints".into(),
         "-o".into(),
         "json".into(),
     ];
+    if let Some(lang) = language {
+        args.push("-l".into());
+        args.push(lang.into());
+    }
 
     eprintln!("[aligner/whisper-apr] invoking sidecar with args: {:?}", args);
     let out = app
@@ -120,82 +261,324 @@ async fn run_alignment_rust(
         ));
     }
 
-    let result: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| format!("parse whisper-apr JSON: {} (stdout: {})", e, &stdout[..stdout.len().min(200)]))?;
-
-    let words_array = transcription_to_words(&result)?;
-    let words_json = serde_json::to_string_pretty(&words_array).map_err(|e| e.to_string())?;
-    std::fs::write(&words_path, &words_json).map_err(|e| e.to_string())?;
-
-    Ok(serde_json::Value::Array(words_array))
+    serde_json::from_str(&stdout)
+        .map_err(|e| format!("parse whisper-apr JSON: {} (stdout: {})", e, &stdout[..stdout.len().min(200)]))
 }
 
-/// Build words.json from LRC text using proportional timing between lines.
-/// Used when LRC is available — preserves the original language and avoids
-/// whisper transcribing/translating into English.
-fn build_words_from_lrc(lrc: &str, dir: &Path) -> Result<serde_json::Value, String> {
+/// Fallback: build words from LRC with per-line VAD onset shift.
+/// Used when no whisper alignment is available.
+fn build_words_from_lrc_vad(lrc: &str, vad: &VocalIntervals) -> Result<Vec<WordEntry>, String> {
+    let lines = crate::lyrics::parse_lrc(lrc);
+    if lines.is_empty() {
+        return Err("LRC has no timestamped lines".into());
+    }
+
+    let mut words: Vec<WordEntry> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let line_start = line.ts_ms;
+        let line_end = lines.get(i + 1).map(|l| l.ts_ms).unwrap_or(line_start + 4000);
+        if line_end <= line_start {
+            continue;
+        }
+
+        let effective_start = match vad.first_vocal_in_window(line_start, line_end) {
+            Some(onset) if onset > line_start + PER_LINE_SHIFT_MIN_MS => onset,
+            _ => line_start,
+        };
+
+        let tokens: Vec<&str> = line.text.split_whitespace().collect();
+        distribute_words_in_line(&tokens, i, effective_start, line_end, &mut words);
+    }
+    if words.is_empty() {
+        return Err("LRC produced no words".into());
+    }
+    Ok(words)
+}
+
+/// Coverage: fraction of LRC-line tokens present in the whisper segment tokens.
+/// Returns (coverage, hits).
+fn coverage(lrc_tokens: &[String], seg_tokens: &[String]) -> (f64, usize) {
+    if lrc_tokens.is_empty() {
+        return (0.0, 0);
+    }
+    let seg_set: std::collections::HashSet<&String> = seg_tokens.iter().collect();
+    let hits = lrc_tokens.iter().filter(|t| seg_set.contains(t)).count();
+    (hits as f64 / lrc_tokens.len() as f64, hits)
+}
+
+/// Map each LRC line → whisper segment (best Jaccard + temporal prior), allowing
+/// multiple lines to share a segment. Then enforce monotonicity: if a line's best
+/// segment would regress, drop it (None → fallback timing later).
+fn align_lines_to_segments(
+    lrc_lines: &[crate::lyrics::LrcLine],
+    segments: &[WhisperSegment],
+) -> Vec<Option<usize>> {
+    let n = lrc_lines.len();
+    let m = segments.len();
+    if n == 0 || m == 0 {
+        return vec![None; n];
+    }
+
+    let line_tokens: Vec<Vec<String>> = lrc_lines
+        .iter()
+        .map(|l| {
+            l.text
+                .split_whitespace()
+                .map(letters_only_lower)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .collect();
+
+    let score = |i: usize, j: usize| -> f64 {
+        let (cov, hits) = coverage(&line_tokens[i], &segments[j].tokens_lower);
+        // Require at least 2 hits and ≥50% of LRC tokens present.
+        if hits < 2 || cov < 0.5 {
+            return f64::NEG_INFINITY;
+        }
+        // Hard gate: LRC line must fall within ±60s of whisper segment mid-point.
+        let seg_mid = (segments[j].start_ms + segments[j].end_ms) as f64 / 2.0;
+        let dt_s = (lrc_lines[i].ts_ms as f64 - seg_mid).abs() / 1000.0;
+        if dt_s > 60.0 {
+            return f64::NEG_INFINITY;
+        }
+        let prior = (-dt_s / 15.0).exp() * 0.3;
+        cov + prior
+    };
+
+    let mut mapping: Vec<Option<usize>> = (0..n)
+        .map(|i| {
+            let mut best: Option<(usize, f64)> = None;
+            for j in 0..m {
+                let s = score(i, j);
+                if s.is_finite() && best.map_or(true, |(_, bs)| s > bs) {
+                    best = Some((j, s));
+                }
+            }
+            best.map(|(j, _)| j)
+        })
+        .collect();
+
+    // Enforce monotonic non-decreasing segment indices.
+    let mut last: Option<usize> = None;
+    for i in 0..n {
+        if let Some(j) = mapping[i] {
+            if let Some(prev) = last {
+                if j < prev {
+                    mapping[i] = None;
+                    continue;
+                }
+            }
+            last = Some(j);
+        }
+    }
+
+    mapping
+}
+
+/// Build words by mapping each LRC line to a whisper segment (best similarity, monotonic).
+/// When multiple contiguous LRC lines share the same whisper segment, the segment time window
+/// is split using each inner line's LRC ts_ms as anchor (LRC already has line-level timing).
+/// The group's leading edge is bumped by VAD to skip intro silence / "[Musica]" tags whisper
+/// sometimes absorbs into the first segment.
+/// Unmatched lines fall back to LRC+VAD timing clamped to matched-neighbor boundaries.
+fn build_words_from_lrc_and_whisper(
+    lrc: &str,
+    segments: &[WhisperSegment],
+    vad: &VocalIntervals,
+) -> Result<Vec<WordEntry>, String> {
+    let lrc_lines = crate::lyrics::parse_lrc(lrc);
+    if lrc_lines.is_empty() {
+        return Err("LRC has no timestamped lines".into());
+    }
+
+    let mapping = align_lines_to_segments(&lrc_lines, segments);
+    let n = lrc_lines.len();
+
+    // Per-line resolved [start_ms, end_ms].
+    let mut line_windows: Vec<Option<(u64, u64)>> = vec![None; n];
+
+    // 1) Resolve matched lines — group consecutive lines sharing the same segment.
+    let mut i = 0;
+    while i < n {
+        let Some(seg_idx) = mapping[i] else {
+            i += 1;
+            continue;
+        };
+        let mut k = i + 1;
+        while k < n && mapping[k] == Some(seg_idx) {
+            k += 1;
+        }
+        let seg = &segments[seg_idx];
+        let group_lines: Vec<usize> = (i..k).collect();
+
+        // Multi-line groups mean whisper merged several lines (often absorbing intro
+        // "[Musica]" or silence). Use the first LRC line ts as lower bound for group
+        // start so the group doesn't begin before the singer actually starts.
+        // Single-line groups trust whisper start directly.
+        let first_lrc_ts = lrc_lines[group_lines[0]].ts_ms;
+        let raw_start = if group_lines.len() > 1 {
+            seg.start_ms.max(first_lrc_ts)
+        } else {
+            seg.start_ms
+        };
+        let group_start = raw_start.min(seg.end_ms.saturating_sub(200));
+
+        let mut cursor = group_start;
+        for (k_idx, &idx) in group_lines.iter().enumerate() {
+            let is_last = k_idx + 1 == group_lines.len();
+            let start = if k_idx == 0 {
+                group_start
+            } else {
+                lrc_lines[idx]
+                    .ts_ms
+                    .clamp(cursor, seg.end_ms.saturating_sub(100))
+            };
+            let end = if is_last {
+                seg.end_ms
+            } else {
+                let next_ts = lrc_lines[group_lines[k_idx + 1]].ts_ms;
+                next_ts.clamp(start + 100, seg.end_ms)
+            };
+            line_windows[idx] = Some((start, end.max(start + 100)));
+            cursor = end;
+        }
+        i = k;
+    }
+
+    // 2) Resolve unmatched lines — clamp LRC window to matched-neighbor anchors,
+    //    then apply per-line VAD onset shift.
+    for idx in 0..n {
+        if line_windows[idx].is_some() {
+            continue;
+        }
+        let line = &lrc_lines[idx];
+        let prev_end: Option<u64> = (0..idx)
+            .rev()
+            .find_map(|k| line_windows[k].map(|(_, e)| e));
+        let next_start: Option<u64> = (idx + 1..n)
+            .find_map(|k| line_windows[k].map(|(s, _)| s));
+
+        let line_start_orig = line.ts_ms;
+        let line_end_orig = lrc_lines
+            .get(idx + 1)
+            .map(|l| l.ts_ms)
+            .unwrap_or(line_start_orig + 4000);
+
+        let clamped_start = match prev_end {
+            Some(p) if line_start_orig < p => p,
+            _ => line_start_orig,
+        };
+        let clamped_end = match next_start {
+            Some(ns) if line_end_orig > ns => ns,
+            _ => line_end_orig,
+        };
+
+        if clamped_end <= clamped_start + 100 {
+            continue;
+        }
+
+        let effective_start = match vad.first_vocal_in_window(clamped_start, clamped_end) {
+            Some(onset) if onset > clamped_start + PER_LINE_SHIFT_MIN_MS => onset,
+            _ => clamped_start,
+        };
+
+        if clamped_end <= effective_start {
+            continue;
+        }
+        line_windows[idx] = Some((effective_start, clamped_end));
+    }
+
+    // 3) Distribute words within each resolved window.
+    let mut words: Vec<WordEntry> = Vec::new();
+    for idx in 0..n {
+        let Some((start_ms, end_ms)) = line_windows[idx] else {
+            continue;
+        };
+        let tokens: Vec<&str> = lrc_lines[idx].text.split_whitespace().collect();
+        distribute_words_in_line(&tokens, idx, start_ms, end_ms, &mut words);
+    }
+
+    if words.is_empty() {
+        return Err("alignment produced no words".into());
+    }
+    Ok(words)
+}
+
+fn write_words_json(dir: &Path, words: &[WordEntry]) -> Result<Value, String> {
+    let arr: Vec<Value> = words.iter().map(|w| w.to_json()).collect();
+    let path = dir.join("words.json");
+    let s = serde_json::to_string_pretty(&arr).map_err(|e| e.to_string())?;
+    std::fs::write(&path, s).map_err(|e| e.to_string())?;
+    Ok(Value::Array(arr))
+}
+
+/// Aligns words for a song.
+///
+/// Strategy:
+/// - Compute (or load cached) VAD on vocals.wav.
+/// - If LRC is synced: detect language from LRC → run whisper with `-l <lang>`.
+///   DP-align LRC lines to whisper segments, retime lines from whisper, distribute
+///   words inside line by vowel count. Unmatched lines fall back to VAD+LRC timing,
+///   clamped to neighbor anchors.
+/// - Otherwise: whisper-only with vowel-proxy distribution inside each segment.
+pub async fn run_alignment(
+    app: &AppHandle,
+    dir: &Path,
+    lrc: Option<&str>,
+) -> Result<Value, String> {
     let words_path = dir.join("words.json");
     if words_path.exists() {
         let s = std::fs::read_to_string(&words_path).map_err(|e| e.to_string())?;
         return serde_json::from_str(&s).map_err(|e| e.to_string());
     }
 
-    let lines = crate::lyrics::parse_lrc(lrc);
-    if lines.is_empty() {
-        return Err("LRC has no timestamped lines".into());
-    }
+    let vad = crate::vad::load_or_compute(dir)?;
 
-    let mut words: Vec<serde_json::Value> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let line_start = line.ts_ms;
-        let line_end = lines.get(i + 1).map(|l| l.ts_ms).unwrap_or(line_start + 4000);
-        let duration = line_end.saturating_sub(line_start).max(1);
-
-        let tokens: Vec<&str> = line.text.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-        let n = tokens.len() as u64;
-        for (j, word) in tokens.iter().enumerate() {
-            let start_ms = line_start + (j as u64 * duration) / n;
-            let end_ms = line_start + ((j as u64 + 1) * duration) / n;
-            words.push(serde_json::json!({
-                "word": word,
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-            }));
-        }
-    }
-
-    if words.is_empty() {
-        return Err("LRC produced no words".into());
-    }
-
-    let json = serde_json::to_string_pretty(&words).map_err(|e| e.to_string())?;
-    std::fs::write(&words_path, &json).map_err(|e| e.to_string())?;
-    Ok(serde_json::Value::Array(words))
-}
-
-/// Use LRC when available (preserves original language); fall back to whisper when absent.
-pub async fn run_alignment(
-    app: &AppHandle,
-    dir: &Path,
-    lrc: Option<&str>,
-) -> Result<serde_json::Value, String> {
     if let Some(lrc_text) = lrc.filter(|t| t.contains('[')) {
-        return build_words_from_lrc(lrc_text, dir);
+        let lang = detect_lrc_language(lrc_text);
+        eprintln!("[aligner] detected LRC language: {:?}", lang);
+
+        let words = if vad.total_vocal_ms() > 5000 {
+            match run_whisper(app, dir, lang).await {
+                Ok(result) => match parse_whisper_segments(&result) {
+                    Ok(segs) => match build_words_from_lrc_and_whisper(lrc_text, &segs, &vad) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!("[aligner] segment-line merge failed, using LRC+VAD only: {}", e);
+                            build_words_from_lrc_vad(lrc_text, &vad)?
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("[aligner] whisper segment parse failed, using LRC+VAD only: {}", e);
+                        build_words_from_lrc_vad(lrc_text, &vad)?
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[aligner] whisper failed, using LRC+VAD only: {}", e);
+                    build_words_from_lrc_vad(lrc_text, &vad)?
+                }
+            }
+        } else {
+            build_words_from_lrc_vad(lrc_text, &vad)?
+        };
+        return write_words_json(dir, &words);
     }
-    run_alignment_rust(app, dir).await
+
+    let result = run_whisper(app, dir, None).await?;
+    let segments = parse_whisper_segments(&result)?;
+    let words = whisper_only_words(&segments)?;
+    write_words_json(dir, &words)
 }
 
 #[tauri::command]
-pub fn get_words(dir: String) -> Result<serde_json::Value, String> {
+pub fn get_words(dir: String) -> Result<Value, String> {
     let words_path = PathBuf::from(&dir).join("words.json");
     if words_path.exists() {
         let s = std::fs::read_to_string(&words_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&s).map_err(|e| e.to_string())
     } else {
-        Ok(serde_json::Value::Null)
+        Ok(Value::Null)
     }
 }
 
@@ -234,4 +617,3 @@ pub fn set_cookie_browser(app: AppHandle, browser: String) -> Result<(), String>
     };
     crate::settings::save_settings(&app, &settings)
 }
-

@@ -12,6 +12,7 @@ mod recorder;
 mod recognizer;
 mod separator;
 mod settings;
+mod vad;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

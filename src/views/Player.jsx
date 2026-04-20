@@ -96,7 +96,7 @@ function Avatar({ name }) {
   );
 }
 
-export default function Player({ song, onSongRefreshed }) {
+export default function Player({ song }) {
   const audioRef = useRef(null);
   const waveformRef = useRef(null);
   const rafRef = useRef(0);
@@ -122,9 +122,6 @@ export default function Player({ song, onSongRefreshed }) {
   const [finalScore, setFinalScore] = useState(null);
   const [rank, setRank] = useState(null);
 
-  const [reprocessing, setReprocessing] = useState(false);
-  const [reprocessMsg, setReprocessMsg] = useState("");
-
   const [topScores, setTopScores] = useState([]);
 
   const lrcLines = useMemo(() => parseLrc(song?.lrc || ""), [song]);
@@ -134,15 +131,42 @@ export default function Player({ song, onSongRefreshed }) {
   const wordsByLine = useMemo(() => {
     if (!wordTimestamps || lrcLines.length === 0) return null;
     const buckets = lrcLines.map(() => []);
-    for (const w of wordTimestamps) {
-      for (let i = 0; i < lrcLines.length; i++) {
-        const start = lrcLines[i].ts_ms;
-        const end = lrcLines[i + 1]?.ts_ms ?? (start + 8000);
-        if (w.start_ms >= start && w.start_ms < end) { buckets[i].push(w); break; }
+    const hasLineField = wordTimestamps.some(w => typeof w.line === "number");
+    if (hasLineField) {
+      for (const w of wordTimestamps) {
+        if (typeof w.line === "number" && buckets[w.line]) buckets[w.line].push(w);
+      }
+    } else {
+      for (const w of wordTimestamps) {
+        for (let i = 0; i < lrcLines.length; i++) {
+          const start = lrcLines[i].ts_ms;
+          const end = lrcLines[i + 1]?.ts_ms ?? (start + 8000);
+          if (w.start_ms >= start && w.start_ms < end) { buckets[i].push(w); break; }
+        }
       }
     }
     return buckets;
   }, [wordTimestamps, lrcLines]);
+
+  // Line activation times — switch current line when previous line's last word ends,
+  // so the next line is shown (big font, no highlight) during gaps.
+  const lineActivations = useMemo(() => {
+    if (lrcLines.length === 0) return [];
+    if (!wordsByLine) return lrcLines.map(l => l.ts_ms);
+    const result = new Array(lrcLines.length);
+    let prevEnd = null;
+    for (let i = 0; i < lrcLines.length; i++) {
+      const ws = wordsByLine[i] || [];
+      const firstStart = ws.length > 0 ? ws[0].start_ms : lrcLines[i].ts_ms;
+      result[i] = prevEnd != null ? Math.min(prevEnd, firstStart) : firstStart;
+      if (ws.length > 0) {
+        prevEnd = ws[ws.length - 1].end_ms;
+      } else {
+        prevEnd = lrcLines[i + 1]?.ts_ms ?? (firstStart + 2000);
+      }
+    }
+    return result;
+  }, [wordsByLine, lrcLines]);
 
   useEffect(() => {
     setWordTimestamps(null);
@@ -185,7 +209,8 @@ export default function Player({ song, onSongRefreshed }) {
     let newLine = -1;
     if (synced) {
       for (let i = 0; i < lrcLines.length; i++) {
-        if (lrcLines[i].ts_ms <= tMs) newLine = i; else break;
+        const act = lineActivations[i] ?? lrcLines[i].ts_ms;
+        if (act <= tMs) newLine = i; else break;
       }
     }
     let newWord = -1;
@@ -212,7 +237,7 @@ export default function Player({ song, onSongRefreshed }) {
       setDisplayTime(t);
     }
     rafRef.current = requestAnimationFrame(tick);
-  }, [synced, lrcLines, wordsByLine, duration]);
+  }, [synced, lrcLines, wordsByLine, lineActivations, duration]);
 
   useEffect(() => {
     if (playing) { rafRef.current = requestAnimationFrame(tick); return () => cancelAnimationFrame(rafRef.current); }
@@ -319,26 +344,6 @@ export default function Player({ song, onSongRefreshed }) {
     setSessionId(null);
   };
 
-  const reprocess = async () => {
-    if (!song?._dir || reprocessing) return;
-    setReprocessing(true); setReprocessMsg("Starting...");
-    let unlisten;
-    try {
-      unlisten = await listen("karaoke://reprocess-progress", (ev) => {
-        const { message, status } = ev.payload || {};
-        if (status === "error") setReprocessMsg("Error: " + message);
-        else setReprocessMsg(message || "");
-      });
-      await invoke("reprocess_song", { dir: song._dir });
-      setReprocessMsg("Done!");
-      await onSongRefreshed?.();
-    } catch (e) { setReprocessMsg("Error: " + e); }
-    finally {
-      unlisten?.();
-      setTimeout(() => { setReprocessing(false); setReprocessMsg(""); }, 1500);
-    }
-  };
-
   if (!song) {
     return (
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16, color: "rgba(237,233,255,0.4)" }}>
@@ -382,17 +387,6 @@ export default function Player({ song, onSongRefreshed }) {
             <Toggle label="Instrumental" active={preferInstrumental} onChange={() => setPreferInstrumental(v => !v)}/>
             <Toggle label="Challenge" active={challenge} icon="🏆" disabled={playing || !!sessionId} onChange={() => setChallenge(v => !v)}/>
             {wordTimestamps && <Toggle label="Word sync" active={true} icon="◉"/>}
-            {reprocessing ? (
-              <span style={{ fontSize: 11, color: "rgba(237,233,255,0.5)", padding: "6px 0" }}>{reprocessMsg}</span>
-            ) : (
-              <button onClick={reprocess} disabled={playing} style={{
-                all: "unset", cursor: playing ? "default" : "pointer",
-                padding: "6px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 600,
-                color: "rgba(237,233,255,0.5)", background: "rgba(255,255,255,0.04)",
-                border: "1px solid rgba(255,255,255,0.06)",
-                opacity: playing ? 0.5 : 1,
-              }}>↻ Re-process</button>
-            )}
           </div>
         </div>
         {/* Score chip */}
