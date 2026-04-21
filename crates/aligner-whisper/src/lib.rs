@@ -250,11 +250,18 @@ impl ForcedAligner {
                 }
                 let wi = token_to_word[global_tok_idx];
                 let (fs, fe) = spans[local_idx];
-                let span_dur = (fe + 1).saturating_sub(fs) as f64 * FRAME_MS / 1000.0;
+                // The first content token in every chunk always gets fs=0 because
+                // the DTW path is forced to start at (0,0).  This bloats span_dur
+                // with all the pre-speech frames and causes a massive back-shift.
+                // Use `fe` (real DTW end of the span) as the effective start: span
+                // collapses to 1 frame, back-shift becomes ~13 ms, and t_start ≈
+                // fe*20 ms which closely tracks the true onset.
+                let effective_fs = if local_idx == 0 { fe } else { fs };
+                let span_dur = (fe + 1).saturating_sub(effective_fs) as f64 * FRAME_MS / 1000.0;
                 // Cross-attention peaks slightly past mid-word for Whisper Small.
-                // 0.55 × span_dur back-shift was empirically optimal (better than 0.5
-                // on the Italian TTS fixture where attention lags word onset by ~55%).
-                let raw_start = chunk_offset + fs as f64 * FRAME_MS / 1000.0;
+                // 0.65 × span_dur back-shift was empirically optimal on the Italian
+                // TTS fixture (attention lags word onset by ~65% of the span).
+                let raw_start = chunk_offset + effective_fs as f64 * FRAME_MS / 1000.0;
                 let t_start = (raw_start - span_dur * 0.65).max(0.0);
                 let t_end = chunk_offset + (fe + 1) as f64 * FRAME_MS / 1000.0;
                 let conf = mean_attention(&smoothed, local_idx, fs, fe);
@@ -363,22 +370,6 @@ fn median_filter_rows(attn: &[Vec<f32>], window: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn mean_attention(
-    attn: &[Vec<f32>],
-    tok_idx: usize,
-    frame_s: usize,
-    frame_e: usize,
-) -> f32 {
-    let row = match attn.get(tok_idx) {
-        Some(r) => r,
-        None => return 0.1,
-    };
-    let n = (frame_e + 1).saturating_sub(frame_s).max(1);
-    let sum: f32 = (frame_s..=frame_e)
-        .filter_map(|f| row.get(f).copied())
-        .sum();
-    (sum / n as f32).clamp(0.0, 1.0)
-}
 
 /// Fill None entries with linear interpolation between known (start, end) anchors.
 fn fill_missing_times(times: &mut [Option<(f64, f64, f32)>], total_dur: f64) {
@@ -447,17 +438,75 @@ fn fill_missing_times(times: &mut [Option<(f64, f64, f32)>], total_dur: f64) {
 }
 
 fn enforce_monotonicity(times: &mut [Option<(f64, f64, f32)>]) {
-    let mut cursor = 0.0f64;
-    for t in times.iter_mut() {
-        if let Some((s, e, _)) = t.as_mut() {
-            if *s < cursor {
-                let dur = (*e - *s).max(0.02);
-                *s = cursor;
-                *e = cursor + dur;
+    // When multiple tokens collide (same back-shifted t_start), distribute
+    // them evenly between the last distinct anchor and the next non-colliding
+    // word. The step is capped at 200 ms so a long inter-phrase pause doesn't
+    // spread colliding words across the entire silence.
+    const MAX_STEP_S: f64 = 0.200;
+    let n = times.len();
+    let mut cursor = 0.0_f64;
+    let mut i = 0;
+    while i < n {
+        match times[i] {
+            None => { i += 1; }
+            Some((s, _, _)) if s > cursor => {
+                cursor = s;
+                i += 1;
             }
-            cursor = *s;
+            Some(_) => {
+                // Collect collision chain.
+                let chain_start = i;
+                let mut j = i;
+                while j < n {
+                    match times[j] {
+                        Some((sj, _, _)) if sj <= cursor => j += 1,
+                        None => j += 1,
+                        _ => break,
+                    }
+                }
+                let some_in_chain: Vec<usize> =
+                    (chain_start..j).filter(|&k| times[k].is_some()).collect();
+                let m = some_in_chain.len();
+                if m == 0 { i = j; continue; }
+
+                let next_anchor = (j..n)
+                    .find_map(|k| {
+                        times[k].and_then(|(s, _, _)| (s > cursor).then_some(s))
+                    })
+                    .unwrap_or(cursor + m as f64 * MAX_STEP_S);
+
+                // Cap step so inter-phrase silence doesn't swallow the chain.
+                let natural_step = (next_anchor - cursor) / (m + 1) as f64;
+                let step = natural_step.min(MAX_STEP_S);
+                for (rank, &k) in some_in_chain.iter().enumerate() {
+                    if let Some((s, e, c)) = times[k] {
+                        let new_s = cursor + (rank + 1) as f64 * step;
+                        let dur = (e - s).max(0.02);
+                        times[k] = Some((new_s, (new_s + dur).min(next_anchor), c));
+                    }
+                }
+                cursor += m as f64 * step;
+                i = j;
+            }
         }
     }
+}
+
+fn mean_attention(
+    attn: &[Vec<f32>],
+    tok_idx: usize,
+    frame_s: usize,
+    frame_e: usize,
+) -> f32 {
+    let row = match attn.get(tok_idx) {
+        Some(r) => r,
+        None => return 0.1,
+    };
+    let n = (frame_e + 1).saturating_sub(frame_s).max(1);
+    let sum: f32 = (frame_s..=frame_e)
+        .filter_map(|f| row.get(f).copied())
+        .sum();
+    (sum / n as f32).clamp(0.0, 1.0)
 }
 
 fn build_empty_output(words: &[String]) -> Vec<AlignedWord> {

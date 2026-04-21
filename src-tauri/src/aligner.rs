@@ -560,6 +560,11 @@ fn load_wav_mono_16k(path: &Path) -> Result<AudioBuffer, String> {
 }
 
 /// Map `AlignedWord` list back to LRC lines and build `WordEntry` list.
+///
+/// LRC timestamps are used as hard bounds: no word may start before its line's
+/// LRC timestamp or end after the next line's LRC timestamp.  When the DTW
+/// center for a line falls outside the LRC window (chunk-assignment error), all
+/// words in that line are redistributed by vowel weight within the LRC window.
 fn aligned_to_word_entries(
     aligned: &[AlignedWord],
     lrc_lines: &[crate::lyrics::LrcLine],
@@ -568,24 +573,68 @@ fn aligned_to_word_entries(
         return vec![];
     }
 
-    // Build a flat list of (word_index, line_index) from LRC.
+    let n_lines = lrc_lines.len();
+
+    // Build word→line mapping and group word indices by line.
     let mut line_for_word: Vec<usize> = Vec::with_capacity(aligned.len());
     for (li, line) in lrc_lines.iter().enumerate() {
         for _ in line.text.split_whitespace() {
             line_for_word.push(li);
         }
     }
+    let mut line_word_indices: Vec<Vec<usize>> = vec![vec![]; n_lines];
+    for (wi, &li) in line_for_word.iter().enumerate() {
+        if wi < aligned.len() {
+            line_word_indices[li].push(wi);
+        }
+    }
 
-    aligned
-        .iter()
-        .enumerate()
-        .map(|(i, aw)| WordEntry {
-            word: aw.word.clone(),
-            start_ms: (aw.start * 1000.0).round() as u64,
-            end_ms: (aw.end * 1000.0).round() as u64,
-            line: line_for_word.get(i).copied(),
-        })
-        .collect()
+    // DTW chunk-assignment tolerance: if the mean DTW start for a line deviates
+    // from the LRC line timestamp by more than this, fall back to vowel distribution.
+    const TOLERANCE_MS: f64 = 5_000.0;
+
+    let mut result: Vec<WordEntry> = Vec::with_capacity(aligned.len());
+
+    for li in 0..n_lines {
+        let indices = &line_word_indices[li];
+        if indices.is_empty() {
+            continue;
+        }
+
+        let lrc_start = lrc_lines[li].ts_ms as f64;
+        let lrc_end = lrc_lines
+            .get(li + 1)
+            .map(|l| l.ts_ms as f64)
+            .unwrap_or(lrc_start + 5_000.0);
+
+        let dtw_center = indices.iter()
+            .map(|&wi| aligned[wi].start * 1_000.0)
+            .sum::<f64>()
+            / indices.len() as f64;
+
+        if (dtw_center - lrc_start).abs() <= TOLERANCE_MS {
+            // DTW is plausible — use it but clamp every word to the LRC window.
+            for &wi in indices {
+                let aw = &aligned[wi];
+                let raw_start = (aw.start * 1_000.0).round() as u64;
+                let raw_end   = (aw.end   * 1_000.0).round() as u64;
+                let start_ms = raw_start.clamp(lrc_start as u64, (lrc_end - 20.0).max(lrc_start) as u64);
+                let end_ms   = raw_end  .clamp(start_ms + 20, lrc_end as u64);
+                result.push(WordEntry {
+                    word: aw.word.clone(),
+                    start_ms,
+                    end_ms,
+                    line: Some(li),
+                });
+            }
+        } else {
+            // DTW chunk assignment was wrong — redistribute by vowel weight.
+            let tokens: Vec<&str> = lrc_lines[li].text.split_whitespace().collect();
+            distribute_words_in_line(&tokens, li, lrc_start as u64, lrc_end as u64, &mut result);
+        }
+    }
+
+    result
 }
 
 /// Run the pure-Rust forced aligner. Returns None if vocals don't exist or on error.

@@ -259,6 +259,96 @@ async fn test_coverage() {
     }
 }
 
+/// Real-song cascade regression test — Willie Peyote "Buon Auspicio", first verse.
+///
+/// The old algorithm produced 1 ms cascade chains for phrase-final words:
+///   questa, start=11263ms  →  si start=11264ms  →  conclude start=11265ms
+/// (back-shift span_dur×0.65 overshot into earlier words' time, causing the
+/// monotonicity nudge to pile up at 1 ms intervals).
+///
+/// This test verifies the fix on the first verse (words 0–7: Quando…conclude):
+///   1. No cascade: consecutive words are ≥ 50 ms apart.
+///   2. First-verse MAE vs words_correct.json < 400 ms.
+///
+/// Note: the full ForcedAligner output (without LRC clamping) drifts for late
+/// words in long songs.  The production pipeline in aligner.rs clamps each word
+/// to its LRC line window, masking that drift.  This test intentionally covers
+/// only the first verse where proportional chunk assignment is correct.
+#[tokio::test]
+async fn test_willie_peyote_no_cascade() {
+    let song_dir = Path::new("/Users/lucazonta/Library/Application Support/com.colognakaraoke.tauri/library/Willie Peyote Official_Willie Peyote - Buon auspicio visual video");
+    let vocals_path = song_dir.join("vocals.wav");
+    let correct_path = song_dir.join("words_correct.json");
+
+    if skip_if_missing(&vocals_path) || skip_if_missing(&correct_path) {
+        return;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CorrectWord { word: String, start_ms: u64 }
+
+    let correct: Vec<CorrectWord> = serde_json::from_str(
+        &std::fs::read_to_string(&correct_path).expect("read words_correct.json"),
+    )
+    .expect("parse words_correct.json");
+
+    // Build lyrics from ALL words so the proportional chunk assignment sees the
+    // full token count — altering the lyrics changes which chunk covers verse 1.
+    let lyrics = correct.iter().map(|w| w.word.as_str()).collect::<Vec<_>>().join(" ");
+
+    let vocals = load_wav_mono_16k(&vocals_path).expect("load vocals.wav");
+    let model = if cfg!(feature = "metal") { WhisperModel::Medium } else { WhisperModel::Small };
+    let config = AlignmentConfig { model, language: "it".to_string(), ..Default::default() };
+    let aligner = ForcedAligner::new(config).await.expect("load model");
+    let result = aligner.align(&vocals, &lyrics).expect("align");
+
+    assert_eq!(result.len(), correct.len(), "word count mismatch");
+
+    // Focus on first verse (words 0–7: Quando…conclude).
+    // These are the words that had the cascade bug.
+    let verse_end = 8.min(result.len());
+
+    // 1) Cascade check: no pair within 50 ms in the first verse.
+    //    (Old bug produced 1 ms gaps; 50 ms gives headroom while catching regressions.)
+    println!("\n── first-verse alignment ───────────────────────────");
+    let mut errors: Vec<f64> = Vec::new();
+    for i in 0..verse_end {
+        let got_ms = result[i].start * 1_000.0;
+        let exp_ms = correct[i].start_ms as f64;
+        let err = (got_ms - exp_ms).abs();
+        errors.push(err);
+        println!("  {:>12}  got={:.0}ms  correct={}ms  err={:.0}ms",
+            result[i].word, got_ms, exp_ms, err);
+    }
+
+    let mut cascade_violations: Vec<String> = Vec::new();
+    for w in result[..verse_end].windows(2) {
+        let gap_ms = (w[1].start - w[0].start) * 1_000.0;
+        if gap_ms < 50.0 {
+            cascade_violations.push(format!(
+                "'{}' ({:.0}ms) → '{}' ({:.0}ms) gap={:.0}ms",
+                w[0].word, w[0].start * 1000.0,
+                w[1].word, w[1].start * 1000.0,
+                gap_ms
+            ));
+        }
+    }
+    if !cascade_violations.is_empty() {
+        println!("\n── cascade violations (first verse) ────────────────");
+        for v in &cascade_violations { println!("  {}", v); }
+    }
+    assert!(
+        cascade_violations.is_empty(),
+        "{} cascade violation(s) in first verse (consecutive words < 50 ms apart)",
+        cascade_violations.len()
+    );
+
+    // 2) MAE check.
+    let mae = errors.iter().sum::<f64>() / errors.len() as f64;
+    println!("\nFirst-verse MAE = {:.1}ms", mae);
+    assert!(mae < 400.0, "First-verse MAE {:.1}ms exceeds 400ms", mae);
+}
+
 /// Two concatenated copies of the clean clip must produce no duplicate words
 /// at the chunk boundary.
 #[tokio::test]
