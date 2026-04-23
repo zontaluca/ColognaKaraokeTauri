@@ -93,7 +93,7 @@ impl ForcedAligner {
             return Err(AlignError::BadSampleRate(vocals.sample_rate));
         }
 
-        let (orig_words, norm_words, _) = normalize_lyrics(lyrics);
+        let (orig_words, norm_words, norm_map) = normalize_lyrics(lyrics);
         if orig_words.is_empty() {
             return Ok(vec![]);
         }
@@ -111,11 +111,21 @@ impl ForcedAligner {
             return Ok(build_empty_output(&orig_words));
         }
 
-        // Build token → word index mapping.
+        // norm_map[orig_idx] = (start_norm, end_norm); build norm_word_idx → orig_word_idx.
+        // Needed because contractions expand (e.g. "don't" → ["do","not"]), making
+        // norm_words.len() > orig_words.len(). token_to_word must stay within orig bounds.
+        let mut norm_to_orig: Vec<usize> = vec![0; norm_words.len()];
+        for (orig_idx, &(s, e)) in norm_map.iter().enumerate() {
+            for ni in s..e {
+                norm_to_orig[ni] = orig_idx;
+            }
+        }
+
+        // Build token → orig word index mapping.
         let token_to_word: Vec<usize> = word_token_ids
             .iter()
             .enumerate()
-            .flat_map(|(wi, toks)| std::iter::repeat(wi).take(toks.len()))
+            .flat_map(|(norm_wi, toks)| std::iter::repeat(norm_to_orig[norm_wi]).take(toks.len()))
             .collect();
 
         let special = SpecialTokens::for_language(
