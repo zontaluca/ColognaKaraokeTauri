@@ -14,6 +14,29 @@ mod separator;
 mod settings;
 mod vad;
 
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+
+#[tauri::command]
+async fn open_presentation_window(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("presentation") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        &app,
+        "presentation",
+        WebviewUrl::App("index.html#presentation".into()),
+    )
+    .title("Cologna Karaoke — Presentation")
+    .inner_size(1280.0, 720.0)
+    .min_inner_size(640.0, 360.0)
+    .resizable(true)
+    .decorations(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -43,6 +66,7 @@ pub fn run() {
             leaderboard::leaderboard_insert,
             leaderboard::leaderboard_top,
             leaderboard::leaderboard_global_top,
+            open_presentation_window,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
