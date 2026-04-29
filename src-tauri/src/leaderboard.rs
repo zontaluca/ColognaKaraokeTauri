@@ -16,6 +16,13 @@ pub struct ScoreEntry {
     pub partials: i64,
     pub misses: i64,
     pub created_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player_id: Option<i64>,
+    /// JSON-encoded list of player ids for duets/group sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player_ids: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo_path: Option<String>,
 }
 
 pub type DbState = Arc<Mutex<Connection>>;
@@ -46,6 +53,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         "#,
     )
     .map_err(|e| e.to_string())?;
+    crate::players::init_schema(&conn)?;
     let state: DbState = Arc::new(Mutex::new(conn));
     app.manage(state);
     Ok(())
@@ -63,8 +71,8 @@ fn now_secs() -> i64 {
 pub fn leaderboard_insert(entry: ScoreEntry, db: State<'_, DbState>) -> Result<i64, String> {
     let conn = db.lock();
     conn.execute(
-        "INSERT INTO scores (song_dir, song_title, player_name, score, hits, partials, misses, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO scores (song_dir, song_title, player_name, score, hits, partials, misses, created_at, player_id, player_ids)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             entry.song_dir,
             entry.song_title,
@@ -74,6 +82,8 @@ pub fn leaderboard_insert(entry: ScoreEntry, db: State<'_, DbState>) -> Result<i
             entry.partials,
             entry.misses,
             now_secs(),
+            entry.player_id,
+            entry.player_ids,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -91,8 +101,18 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<ScoreEntry> {
         partials: row.get(6)?,
         misses: row.get(7)?,
         created_at: row.get(8)?,
+        player_id: row.get(9).ok(),
+        player_ids: row.get(10).ok(),
+        photo_path: row.get(11).ok(),
     })
 }
+
+pub fn row_to_entry_pub(row: &rusqlite::Row) -> rusqlite::Result<ScoreEntry> {
+    row_to_entry(row)
+}
+
+const SELECT_COLS: &str =
+    "s.id, s.song_dir, s.song_title, s.player_name, s.score, s.hits, s.partials, s.misses, s.created_at, s.player_id, s.player_ids, p.photo_path";
 
 #[tauri::command]
 pub fn leaderboard_top(
@@ -101,12 +121,12 @@ pub fn leaderboard_top(
     db: State<'_, DbState>,
 ) -> Result<Vec<ScoreEntry>, String> {
     let conn = db.lock();
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, song_dir, song_title, player_name, score, hits, partials, misses, created_at
-             FROM scores WHERE song_dir = ?1 ORDER BY score DESC, created_at ASC LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT {cols} FROM scores s LEFT JOIN players p ON p.id = s.player_id
+         WHERE s.song_dir = ?1 ORDER BY s.score DESC, s.created_at ASC LIMIT ?2",
+        cols = SELECT_COLS
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![song_dir, limit], row_to_entry)
         .map_err(|e| e.to_string())?;
@@ -123,12 +143,12 @@ pub fn leaderboard_global_top(
     db: State<'_, DbState>,
 ) -> Result<Vec<ScoreEntry>, String> {
     let conn = db.lock();
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, song_dir, song_title, player_name, score, hits, partials, misses, created_at
-             FROM scores ORDER BY score DESC, created_at ASC LIMIT ?1",
-        )
-        .map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT {cols} FROM scores s LEFT JOIN players p ON p.id = s.player_id
+         ORDER BY s.score DESC, s.created_at ASC LIMIT ?1",
+        cols = SELECT_COLS
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![limit], row_to_entry)
         .map_err(|e| e.to_string())?;

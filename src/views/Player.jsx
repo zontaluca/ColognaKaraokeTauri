@@ -84,15 +84,16 @@ function AccuracyRing({ value, label, color, total = 40 }) {
   );
 }
 
-function Avatar({ name }) {
+function Avatar({ name, photo }) {
   const hue = [...(name || "?")].reduce((a, c) => a + c.charCodeAt(0), 0) * 37 % 360;
+  const src = photo ? convertFileSrc(photo) : null;
   return (
     <div style={{
       width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
-      background: `hsl(${hue}, 70%, 55%)`,
+      background: src ? `url(${src}) center/cover no-repeat` : `hsl(${hue}, 70%, 55%)`,
       fontSize: 9.5, fontWeight: 700, color: "#FFF",
       display: "flex", alignItems: "center", justifyContent: "center",
-    }}>{(name || "?")[0]}</div>
+    }}>{!src && (name || "?")[0]}</div>
   );
 }
 
@@ -115,7 +116,10 @@ export default function Player({ song }) {
 
   const [challenge, setChallenge] = useState(false);
   const [playerName, setPlayerName] = useState("");
+  const [playerId, setPlayerId] = useState(null);
+  const [profiles, setProfiles] = useState([]);
   const [askName, setAskName] = useState(false);
+  const [guestName, setGuestName] = useState("");
   const [sessionId, setSessionId] = useState(null);
   const [scoreState, setScoreState] = useState({ hits: 0, partials: 0, misses: 0 });
   const [wordStatuses, setWordStatuses] = useState({});
@@ -196,6 +200,13 @@ export default function Player({ song }) {
       .then(t => setTopScores(Array.isArray(t) ? t : []))
       .catch(() => {});
   }, [song]);
+
+  useEffect(() => {
+    if (!askName) return;
+    invoke("players_list")
+      .then(list => setProfiles(Array.isArray(list) ? list : []))
+      .catch(() => {});
+  }, [askName]);
 
   useEffect(() => { if (audioRef.current) audioRef.current.volume = volume; }, [volume]);
 
@@ -302,8 +313,12 @@ export default function Player({ song }) {
     setDisplayTime(a.currentTime);
   };
 
-  const startChallenge = async () => {
-    if (!song?._dir || !playerName.trim()) return;
+  const startChallenge = async (selectedName, selectedId) => {
+    if (!song?._dir) return;
+    const finalName = (selectedName || playerName || "").trim();
+    if (!finalName) return;
+    setPlayerName(finalName);
+    setPlayerId(selectedId ?? null);
     const sid = `${Date.now()}`;
     setSessionId(sid);
     setScoreState({ hits: 0, partials: 0, misses: 0 });
@@ -331,6 +346,8 @@ export default function Player({ song }) {
         entry: {
           song_dir: song._dir, song_title: song.title || "",
           player_name: playerName.trim() || "Anonymous",
+          player_id: playerId ?? null,
+          player_ids: playerId != null ? JSON.stringify([playerId]) : null,
           score, hits: scoreState.hits, partials: scoreState.partials, misses: scoreState.misses,
         },
       });
@@ -538,7 +555,7 @@ export default function Player({ song }) {
                     <div style={{ fontSize: 11, fontWeight: 700, color: i === 0 ? "#FFD166" : "rgba(237,233,255,0.5)", fontFamily: "var(--font-mono)", width: 14 }}>
                       {i + 1}
                     </div>
-                    <Avatar name={e.player_name}/>
+                    <Avatar name={e.player_name} photo={e.photo_path}/>
                     <div style={{ flex: 1, fontSize: 12, fontWeight: 600, color: "#FFF", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {e.player_name}
                     </div>
@@ -639,31 +656,80 @@ export default function Player({ song }) {
 
       {src && <audio ref={audioRef} src={src} preload="metadata"/>}
 
-      {/* Ask name modal */}
+      {/* Profile picker modal */}
       {askName && (
         <div style={{
           position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)",
           display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
         }} onClick={() => setAskName(false)}>
           <div style={{
-            background: "#0D0B18", borderRadius: 20, padding: 28, minWidth: 360, maxWidth: 480,
+            background: "#0D0B18", borderRadius: 20, padding: 28, width: "min(520px, 100%)", maxHeight: "80vh",
             border: "1px solid rgba(255,255,255,0.08)",
             boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
+            display: "flex", flexDirection: "column", overflow: "hidden",
           }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ margin: "0 0 8px", fontFamily: "var(--font-display)", fontSize: 20, color: "#FFF" }}>Challenge Mode 🏆</h3>
-            <p style={{ margin: "0 0 20px", color: "rgba(237,233,255,0.6)", fontSize: 13 }}>Enter your name to save your score.</p>
+            <h3 style={{ margin: "0 0 6px", fontFamily: "var(--font-display)", fontSize: 22, color: "#FFF" }}>Challenge Mode 🏆</h3>
+            <p style={{ margin: "0 0 18px", color: "rgba(237,233,255,0.6)", fontSize: 13 }}>
+              Scegli il profilo con cui salvare il punteggio.
+            </p>
+
+            {profiles.length > 0 && (
+              <>
+                <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.2, color: "rgba(237,233,255,0.5)", textTransform: "uppercase", marginBottom: 8 }}>Profili</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 8, marginBottom: 18, overflowY: "auto", maxHeight: 280 }}>
+                  {profiles.map(p => {
+                    const photo = p.photo_path ? convertFileSrc(p.photo_path) : null;
+                    const hue = [...(p.name || "?")].reduce((a, c) => a + c.charCodeAt(0), 0) * 37 % 360;
+                    return (
+                      <button key={p.id} onClick={() => startChallenge(p.name, p.id)} style={{
+                        all: "unset", cursor: "pointer",
+                        padding: 12, borderRadius: 14,
+                        background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)",
+                        display: "flex", alignItems: "center", gap: 10,
+                        transition: "all 140ms",
+                      }}
+                        onMouseEnter={e => { e.currentTarget.style.background = "rgba(255,107,90,0.12)"; e.currentTarget.style.borderColor = "rgba(255,107,90,0.35)"; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; e.currentTarget.style.borderColor = "rgba(255,255,255,0.08)"; }}
+                      >
+                        <div style={{
+                          width: 38, height: 38, borderRadius: "50%", flexShrink: 0,
+                          background: photo ? `url(${photo}) center/cover no-repeat` : `hsl(${hue}, 70%, 55%)`,
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          fontSize: 14, fontWeight: 700, color: "#FFF",
+                        }}>
+                          {!photo && (p.name[0] || "?").toUpperCase()}
+                        </div>
+                        <div style={{ minWidth: 0, flex: 1, fontSize: 13, fontWeight: 600, color: "#FFF", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {p.name}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.2, color: "rgba(237,233,255,0.5)", textTransform: "uppercase", marginBottom: 8 }}>
+              {profiles.length > 0 ? "Oppure ospite" : "Ospite"}
+            </div>
             <input
               style={{
                 width: "100%", padding: "12px 16px", borderRadius: 12, boxSizing: "border-box",
                 background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)",
                 color: "#FFF", fontSize: 14, fontFamily: "var(--font-sans)", outline: "none",
               }}
-              value={playerName} onChange={e => setPlayerName(e.target.value)}
-              placeholder="Your name" autoFocus
+              value={guestName} onChange={e => setGuestName(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && guestName.trim()) startChallenge(guestName.trim(), null); }}
+              placeholder="Nome ospite (non salvato come profilo)"
             />
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
-              <button style={{ all: "unset", cursor: "pointer", padding: "10px 16px", borderRadius: 10, fontSize: 13, fontWeight: 600, background: "rgba(255,255,255,0.05)", color: "#EDE9FF", border: "1px solid rgba(255,255,255,0.08)" }} onClick={() => setAskName(false)}>Cancel</button>
-              <button style={{ all: "unset", cursor: playerName.trim() ? "pointer" : "default", padding: "10px 16px", borderRadius: 10, fontSize: 13, fontWeight: 600, background: CK_GRADIENT, color: "#FFF", opacity: playerName.trim() ? 1 : 0.5 }} onClick={startChallenge} disabled={!playerName.trim()}>Start Singing</button>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 16, alignItems: "center" }}>
+              <span style={{ fontSize: 11, color: "rgba(237,233,255,0.4)" }}>
+                💡 Crea profili dalla sezione “Profili”
+              </span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button style={{ all: "unset", cursor: "pointer", padding: "10px 16px", borderRadius: 10, fontSize: 13, fontWeight: 600, background: "rgba(255,255,255,0.05)", color: "#EDE9FF", border: "1px solid rgba(255,255,255,0.08)" }} onClick={() => setAskName(false)}>Annulla</button>
+                <button style={{ all: "unset", cursor: guestName.trim() ? "pointer" : "default", padding: "10px 16px", borderRadius: 10, fontSize: 13, fontWeight: 600, background: CK_GRADIENT, color: "#FFF", opacity: guestName.trim() ? 1 : 0.5 }} onClick={() => startChallenge(guestName.trim(), null)} disabled={!guestName.trim()}>Canta come ospite</button>
+              </div>
             </div>
           </div>
         </div>

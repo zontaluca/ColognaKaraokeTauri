@@ -6,6 +6,7 @@ import Library from "./views/Library.jsx";
 import Download from "./views/Download.jsx";
 import Player from "./views/Player.jsx";
 import Leaderboard from "./views/Leaderboard.jsx";
+import Players from "./views/Players.jsx";
 import Settings from "./views/Settings.jsx";
 import { JobsProvider, JobsToast } from "./jobsContext.jsx";
 import Background from "./components/Background.jsx";
@@ -63,6 +64,7 @@ export default function App() {
           {view === "download" && <Download />}
           {view === "player" && <Player song={currentSong} />}
           {view === "leaderboard" && <Leaderboard songs={songs} />}
+          {view === "players" && <Players />}
           {view === "settings" && <Settings />}
         </main>
       </div>
