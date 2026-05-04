@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 
 const CK_GRADIENT = "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)";
 
@@ -31,7 +31,7 @@ function useBars(song, count = 72) {
     const seed = (song?.title || "x").split("").reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 7);
     let s = seed || 1;
     const next = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
-    return Array.from({ length: count }, () => 8 + Math.abs(Math.sin(count * 0.4) + Math.cos(count * 0.12)) * 22 + next() * 10);
+    return Array.from({ length: count }, (_, i) => 8 + Math.abs(Math.sin(i * 0.4) + Math.cos(i * 0.12)) * 22 + next() * 10);
   }, [song, count]);
 }
 
@@ -102,6 +102,9 @@ export default function Player({ song }) {
   const rafRef = useRef(0);
   const activeLineRef = useRef(null);
   const lastSeekRef = useRef(0);
+  const stageRef = useRef(null);
+  const [isLyricFullscreen, setIsLyricFullscreen] = useState(false);
+  const [presentOpen, setPresentOpen] = useState(false);
 
   const [src, setSrc] = useState(null);
   const [playing, setPlaying] = useState(false);
@@ -280,6 +283,80 @@ export default function Player({ song }) {
     return () => unlisten && unlisten();
   }, [challenge]);
 
+  // Fullscreen state tracking (native Fullscreen API on the lyric stage)
+  useEffect(() => {
+    const onFs = () => setIsLyricFullscreen(document.fullscreenElement === stageRef.current);
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, []);
+
+  const toggleLyricFullscreen = useCallback(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen?.();
+    } else {
+      el.requestFullscreen?.();
+    }
+  }, []);
+
+  // Keyboard shortcut: 'F' toggles lyric fullscreen (ignored when typing in inputs)
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== "f" && e.key !== "F") return;
+      const tag = (e.target?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || e.target?.isContentEditable) return;
+      e.preventDefault();
+      toggleLyricFullscreen();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleLyricFullscreen]);
+
+  // Presentation window: sync init (song + parsed lyrics) whenever song/alignment changes
+  useEffect(() => {
+    if (!song) return;
+    emit("karaoke://presentation-init", {
+      song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
+      lrcLines, wordsByLine,
+    }).catch(() => {});
+  }, [song, lrcLines, wordsByLine]);
+
+  // Re-send init when the presentation window signals it is ready
+  useEffect(() => {
+    let unlisten;
+    (async () => {
+      unlisten = await listen("karaoke://presentation-ready", () => {
+        setPresentOpen(true);
+        if (!song) return;
+        emit("karaoke://presentation-init", {
+          song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
+          lrcLines, wordsByLine,
+        }).catch(() => {});
+        emit("karaoke://presentation-tick", { currentIdx, wordIdx, wordStatuses }).catch(() => {});
+      });
+    })();
+    return () => unlisten && unlisten();
+  }, [song, lrcLines, wordsByLine, currentIdx, wordIdx, wordStatuses]);
+
+  useEffect(() => {
+    let unlisten;
+    (async () => {
+      unlisten = await listen("karaoke://presentation-closed", () => setPresentOpen(false));
+    })();
+    return () => unlisten && unlisten();
+  }, []);
+
+  // Stream active line/word + score statuses to the presentation window
+  useEffect(() => {
+    emit("karaoke://presentation-tick", { currentIdx, wordIdx, wordStatuses }).catch(() => {});
+  }, [currentIdx, wordIdx, wordStatuses]);
+
+  const openPresentation = useCallback(async () => {
+    try { await invoke("open_presentation_window"); setPresentOpen(true); }
+    catch (e) { console.error("open_presentation_window", e); }
+  }, []);
+
   const toggle = async () => {
     const a = audioRef.current;
     if (!a) return;
@@ -387,6 +464,8 @@ export default function Player({ song }) {
             <Toggle label="Instrumental" active={preferInstrumental} onChange={() => setPreferInstrumental(v => !v)}/>
             <Toggle label="Challenge" active={challenge} icon="🏆" disabled={playing || !!sessionId} onChange={() => setChallenge(v => !v)}/>
             {wordTimestamps && <Toggle label="Word sync" active={true} icon="◉"/>}
+            <Toggle label={isLyricFullscreen ? "Exit fullscreen" : "Fullscreen"} active={isLyricFullscreen} icon="⛶" onChange={toggleLyricFullscreen}/>
+            <Toggle label={presentOpen ? "Presentation ON" : "Presentation"} active={presentOpen} icon="📺" onChange={openPresentation}/>
           </div>
         </div>
         {/* Score chip */}
@@ -408,10 +487,10 @@ export default function Player({ song }) {
       </div>
 
       {/* Stage + side panel */}
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 260px", gap: 14, minHeight: 0 }}>
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: isLyricFullscreen ? "1fr" : "1fr 260px", gap: 14, minHeight: 0 }}>
         {/* Lyric stage */}
-        <div style={{
-          position: "relative", borderRadius: 20, overflow: "hidden",
+        <div ref={stageRef} style={{
+          position: "relative", borderRadius: isLyricFullscreen ? 0 : 20, overflow: "hidden",
           background: "radial-gradient(ellipse at 50% 30%, rgba(255,107,90,0.1), rgba(7,6,12,0) 55%), linear-gradient(180deg, #0D0B18 0%, #07060C 100%)",
           border: "1px solid rgba(255,255,255,0.06)",
           display: "flex", flexDirection: "column", minHeight: 0,
@@ -421,12 +500,16 @@ export default function Player({ song }) {
           <div style={{ position: "absolute", top: -60, right: -40, width: 280, height: 280, background: "radial-gradient(circle, rgba(242,61,109,0.15), transparent 70%)", filter: "blur(20px)", animation: "floaty 8s ease-in-out infinite reverse", pointerEvents: "none" }}/>
 
           {synced ? (
-            <div style={{ flex: 1, overflowY: "auto", padding: "0 40px", scrollBehavior: "smooth", scrollbarWidth: "none" }}
+            <div style={{ flex: 1, overflowY: "auto", padding: isLyricFullscreen ? "0 6vmin" : "0 40px", scrollBehavior: "smooth", scrollbarWidth: "none" }}
               className="lyrics-scroll">
               <div style={{ height: "40%", flexShrink: 0 }}/>
               {lrcLines.map((line, i) => {
                 const isCurrent = i === currentIdx;
                 const isPast = i < currentIdx;
+                const isAdjacent = i === currentIdx + 1 || i === currentIdx - 1;
+                const fsCurrent = isLyricFullscreen ? "clamp(40px, 9vmin, 160px)" : "clamp(32px, 6.5vmin, 120px)";
+                const fsAdjacent = isLyricFullscreen ? "clamp(22px, 4.2vmin, 72px)" : "clamp(18px, 3vmin, 56px)";
+                const fsFar = isLyricFullscreen ? "clamp(16px, 3vmin, 52px)" : "clamp(14px, 2.3vmin, 44px)";
                 const lineWords = isCurrent
                   ? (wordsByLine?.[i]?.length > 0
                     ? wordsByLine[i]
@@ -436,9 +519,9 @@ export default function Player({ song }) {
                   <div key={i} ref={isCurrent ? activeLineRef : null} style={{
                     textAlign: "center", padding: "10px 0",
                     fontFamily: "var(--font-display)",
-                    fontSize: isCurrent ? 44 : (i === currentIdx + 1 || i === currentIdx - 1) ? 22 : 18,
+                    fontSize: isCurrent ? fsCurrent : isAdjacent ? fsAdjacent : fsFar,
                     fontWeight: isCurrent ? 700 : 500,
-                    letterSpacing: isCurrent ? -1.5 : -0.4,
+                    letterSpacing: isCurrent ? "-0.035em" : "-0.02em",
                     lineHeight: 1.15,
                     color: isPast ? "rgba(237,233,255,0.25)" : isCurrent ? "#FFF" : (i === currentIdx + 1 ? "rgba(237,233,255,0.35)" : "rgba(237,233,255,0.2)"),
                     transition: "all 200ms ease",
