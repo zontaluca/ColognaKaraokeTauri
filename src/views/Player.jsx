@@ -116,6 +116,8 @@ export default function Player({ song }) {
   const [wordIdx, setWordIdx] = useState(-1);
   const [displayTime, setDisplayTime] = useState(0);
 
+  const [wordSync, setWordSync] = useState(false);
+
   const [challenge, setChallenge] = useState(false);
   const [playerName, setPlayerName] = useState("");
   const [askName, setAskName] = useState(false);
@@ -151,15 +153,17 @@ export default function Player({ song }) {
     return buckets;
   }, [wordTimestamps, lrcLines]);
 
+  const effectiveWordsByLine = useMemo(() => wordSync ? wordsByLine : null, [wordSync, wordsByLine]);
+
   // Line activation times — switch current line when previous line's last word ends,
   // so the next line is shown (big font, no highlight) during gaps.
   const lineActivations = useMemo(() => {
     if (lrcLines.length === 0) return [];
-    if (!wordsByLine) return lrcLines.map(l => l.ts_ms);
+    if (!effectiveWordsByLine) return lrcLines.map(l => l.ts_ms);
     const result = new Array(lrcLines.length);
     let prevEnd = null;
     for (let i = 0; i < lrcLines.length; i++) {
-      const ws = wordsByLine[i] || [];
+      const ws = effectiveWordsByLine[i] || [];
       const firstStart = ws.length > 0 ? ws[0].start_ms : lrcLines[i].ts_ms;
       result[i] = prevEnd != null ? Math.min(prevEnd, firstStart) : firstStart;
       if (ws.length > 0) {
@@ -169,7 +173,7 @@ export default function Player({ song }) {
       }
     }
     return result;
-  }, [wordsByLine, lrcLines]);
+  }, [effectiveWordsByLine, lrcLines]);
 
   useEffect(() => {
     setWordTimestamps(null);
@@ -218,8 +222,8 @@ export default function Player({ song }) {
     }
     let newWord = -1;
     if (newLine >= 0) {
-      if (wordsByLine && wordsByLine[newLine]?.length > 0) {
-        const arr = wordsByLine[newLine];
+      if (effectiveWordsByLine && effectiveWordsByLine[newLine]?.length > 0) {
+        const arr = effectiveWordsByLine[newLine];
         for (let i = 0; i < arr.length; i++) {
           if (arr[i].start_ms <= tMs) newWord = i; else break;
         }
@@ -240,7 +244,7 @@ export default function Player({ song }) {
       setDisplayTime(t);
     }
     rafRef.current = requestAnimationFrame(tick);
-  }, [synced, lrcLines, wordsByLine, lineActivations, duration]);
+  }, [synced, lrcLines, effectiveWordsByLine, lineActivations, duration]);
 
   useEffect(() => {
     if (playing) { rafRef.current = requestAnimationFrame(tick); return () => cancelAnimationFrame(rafRef.current); }
@@ -318,9 +322,9 @@ export default function Player({ song }) {
     if (!song) return;
     emit("karaoke://presentation-init", {
       song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
-      lrcLines, wordsByLine,
+      lrcLines, wordsByLine: effectiveWordsByLine,
     }).catch(() => {});
-  }, [song, lrcLines, wordsByLine]);
+  }, [song, lrcLines, effectiveWordsByLine]);
 
   // Re-send init when the presentation window signals it is ready
   useEffect(() => {
@@ -331,13 +335,13 @@ export default function Player({ song }) {
         if (!song) return;
         emit("karaoke://presentation-init", {
           song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
-          lrcLines, wordsByLine,
+          lrcLines, wordsByLine: effectiveWordsByLine,
         }).catch(() => {});
         emit("karaoke://presentation-tick", { currentIdx, wordIdx, wordStatuses }).catch(() => {});
       });
     })();
     return () => unlisten && unlisten();
-  }, [song, lrcLines, wordsByLine, currentIdx, wordIdx, wordStatuses]);
+  }, [song, lrcLines, effectiveWordsByLine, currentIdx, wordIdx, wordStatuses]);
 
   useEffect(() => {
     let unlisten;
@@ -463,7 +467,7 @@ export default function Player({ song }) {
           <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
             <Toggle label="Instrumental" active={preferInstrumental} onChange={() => setPreferInstrumental(v => !v)}/>
             <Toggle label="Challenge" active={challenge} icon="🏆" disabled={playing || !!sessionId} onChange={() => setChallenge(v => !v)}/>
-            {wordTimestamps && <Toggle label="Word sync" active={true} icon="◉"/>}
+            {wordTimestamps && <Toggle label="Word sync (Experimental)" active={wordSync} icon="◉" onChange={() => setWordSync(v => !v)}/>}
             <Toggle label={isLyricFullscreen ? "Exit fullscreen" : "Fullscreen"} active={isLyricFullscreen} icon="⛶" onChange={toggleLyricFullscreen}/>
             <Toggle label={presentOpen ? "Presentation ON" : "Presentation"} active={presentOpen} icon="📺" onChange={openPresentation}/>
           </div>
@@ -510,9 +514,9 @@ export default function Player({ song }) {
                 const fsCurrent = isLyricFullscreen ? "clamp(40px, 9vmin, 160px)" : "clamp(32px, 6.5vmin, 120px)";
                 const fsAdjacent = isLyricFullscreen ? "clamp(22px, 4.2vmin, 72px)" : "clamp(18px, 3vmin, 56px)";
                 const fsFar = isLyricFullscreen ? "clamp(16px, 3vmin, 52px)" : "clamp(14px, 2.3vmin, 44px)";
-                const lineWords = isCurrent
-                  ? (wordsByLine?.[i]?.length > 0
-                    ? wordsByLine[i]
+                const lineWords = isCurrent && wordSync
+                  ? (effectiveWordsByLine?.[i]?.length > 0
+                    ? effectiveWordsByLine[i]
                     : line.text.trim().split(/\s+/).map(w => ({ word: w })))
                   : null;
                 return (
