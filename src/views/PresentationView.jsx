@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 
 export default function PresentationView() {
   const [song, setSong] = useState(null);
@@ -32,19 +32,14 @@ export default function PresentationView() {
   }, []);
 
   useEffect(() => {
-    try {
-      const w = getCurrentWindow();
-      const onClose = w.onCloseRequested(() => {
-        emit("karaoke://presentation-closed", {}).catch(() => {});
-      });
-      return () => { onClose.then(u => u()).catch(() => {}); };
-    } catch { /* not running in tauri */ }
-  }, []);
-
-  useEffect(() => {
     if (!activeLineRef.current) return;
     activeLineRef.current.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [currentIdx]);
+
+  const handleClose = () => {
+    emit("karaoke://presentation-closed", {}).catch(() => {});
+    invoke("close_presentation_window").catch(() => {});
+  };
 
   const hasSynced = lrcLines.length > 0;
 
@@ -129,6 +124,28 @@ export default function PresentationView() {
           {song ? "No synced lyrics" : "Waiting for player..."}
         </div>
       )}
+      <div style={{
+        position: "absolute", bottom: "2vmin", right: "2vmin",
+        zIndex: 100,
+      }}>
+        <button onClick={handleClose} style={{
+          background: "rgba(255,255,255,0.08)",
+          border: "1px solid rgba(255,255,255,0.18)",
+          color: "rgba(237,233,255,0.6)",
+          fontSize: "clamp(11px, 1.4vmin, 18px)",
+          padding: "0.6em 1.2em",
+          borderRadius: "0.6em",
+          cursor: "pointer",
+          fontFamily: "var(--font-display)",
+          letterSpacing: "0.04em",
+          transition: "background 150ms ease, color 150ms ease",
+        }}
+          onMouseEnter={e => { e.currentTarget.style.background = "rgba(255,255,255,0.16)"; e.currentTarget.style.color = "#FFF"; }}
+          onMouseLeave={e => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; e.currentTarget.style.color = "rgba(237,233,255,0.6)"; }}
+        >
+          Chiudi finestra
+        </button>
+      </div>
     </div>
   );
 }

@@ -31,7 +31,7 @@ function useBars(song, count = 72) {
     const seed = (song?.title || "x").split("").reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 7);
     let s = seed || 1;
     const next = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
-    return Array.from({ length: count }, () => 8 + Math.abs(Math.sin(count * 0.4) + Math.cos(count * 0.12)) * 22 + next() * 10);
+    return Array.from({ length: count }, (_, i) => 8 + Math.abs(Math.sin(i * 0.4) + Math.cos(i * 0.12)) * 22 + next() * 10);
   }, [song, count]);
 }
 

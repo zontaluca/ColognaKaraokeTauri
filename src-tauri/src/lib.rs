@@ -17,6 +17,14 @@ mod vad;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
+async fn close_presentation_window(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("presentation") {
+        win.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn open_presentation_window(app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("presentation") {
         let _ = win.set_focus();
@@ -67,6 +75,7 @@ pub fn run() {
             leaderboard::leaderboard_top,
             leaderboard::leaderboard_global_top,
             open_presentation_window,
+            close_presentation_window,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
