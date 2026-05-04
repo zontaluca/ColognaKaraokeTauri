@@ -62,6 +62,16 @@ pub enum AlignError {
     BadSampleRate(u32),
 }
 
+/// LRC-derived phrase anchor: a known phrase start time + the words in that
+/// phrase.  When these are available the aligner partitions the audio per
+/// phrase and runs DTW on each slice independently, eliminating the
+/// long-song proportional-token-assignment drift.
+#[derive(Debug, Clone)]
+pub struct PhraseAnchor {
+    pub time_sec: f64,
+    pub words: Vec<String>,
+}
+
 // ─── ForcedAligner ───────────────────────────────────────────────────────────
 
 pub struct ForcedAligner {
@@ -141,17 +151,29 @@ impl ForcedAligner {
 
         let total_dur =
             vocals.samples.len() as f64 / vocals.sample_rate as f64;
+
+        // Detect vocal onset/offset using frame-level energy.  Songs often have
+        // 10–60 s of instrumental intro/outro; if we use total_dur for the
+        // proportional token-to-chunk split, late words get assigned to empty
+        // post-vocal chunks and drift massively.  Use active_dur (onset→offset)
+        // instead so token density matches vocal density.
+        let (vocal_onset, vocal_offset) = detect_vocal_range(&vocals.samples, vocals.sample_rate);
+        let active_dur = (vocal_offset - vocal_onset).max(1.0);
+
         let chunks = make_chunks(
             &vocals.samples,
             self.config.chunk_seconds,
             self.config.overlap_seconds,
         );
         info!(
-            "aligning {} words ({} tokens) across {} chunks, total {:.1}s",
+            "aligning {} words ({} tokens) across {} chunks, total {:.1}s, active {:.1}s ({:.1}s→{:.1}s)",
             orig_words.len(),
             flat_tokens.len(),
             chunks.len(),
-            total_dur
+            total_dur,
+            active_dur,
+            vocal_onset,
+            vocal_offset,
         );
 
         // word_times[i] = Some((start, end, confidence)) or None.
@@ -162,10 +184,17 @@ impl ForcedAligner {
             let chunk_end =
                 (chunk_offset + self.config.chunk_seconds as f64).min(total_dur);
 
-            // Determine which content tokens belong to this chunk by proportional
-            // split, with a small overlap buffer to avoid boundary drop-outs.
-            let frac_s = (chunk_offset / total_dur).clamp(0.0, 1.0);
-            let frac_e = (chunk_end / total_dur).clamp(0.0, 1.0);
+            // Skip chunks entirely outside the active vocal range.
+            if *chunk_offset >= vocal_offset || chunk_end <= vocal_onset {
+                continue;
+            }
+
+            // Map chunk boundaries into the active-vocal timeline, then compute
+            // proportional token span against active_dur.
+            let active_chunk_start = (chunk_offset - vocal_onset).max(0.0);
+            let active_chunk_end = (chunk_end - vocal_onset).min(active_dur);
+            let frac_s = (active_chunk_start / active_dur).clamp(0.0, 1.0);
+            let frac_e = (active_chunk_end / active_dur).clamp(0.0, 1.0);
             let buf = 5; // token overlap buffer
             let tok_s =
                 ((frac_s * flat_tokens.len() as f64) as usize).saturating_sub(buf);
@@ -292,6 +321,11 @@ impl ForcedAligner {
         // Enforce non-decreasing start times.
         enforce_monotonicity(&mut word_times);
 
+        // Correct leading-word placement errors caused by instrumental intros:
+        // if the first N words land far before the next word (large forward jump),
+        // back-extrapolate their positions from the first reliable anchor.
+        fix_leading_outliers(&mut word_times);
+
         let result = orig_words
             .iter()
             .enumerate()
@@ -309,6 +343,111 @@ impl ForcedAligner {
             .collect();
 
         Ok(result)
+    }
+
+    /// Align lyrics to audio using LRC phrase anchors.
+    ///
+    /// For each phrase `i`, extract the audio window
+    /// `[phrases[i].time_sec, phrases[i+1].time_sec]` (plus a small DTW
+    /// context pad past the window) and run the regular
+    /// [`ForcedAligner::align`] on just the words of that phrase.  Output
+    /// word times are then clamped to the strict phrase window so no word
+    /// bleeds into the next phrase's LRC range.
+    ///
+    /// `dtw_pad_sec` extends the audio fed to DTW past the phrase boundary
+    /// so the decoder has room for the final word's attention peak; the
+    /// extra frames are dropped when clamping back to the phrase window.
+    pub fn align_with_phrases(
+        &self,
+        vocals: &AudioBuffer,
+        phrases: &[PhraseAnchor],
+        dtw_pad_sec: f64,
+    ) -> Result<Vec<AlignedWord>, AlignError> {
+        if vocals.sample_rate != 16_000 {
+            return Err(AlignError::BadSampleRate(vocals.sample_rate));
+        }
+        let total_dur = vocals.samples.len() as f64 / vocals.sample_rate as f64;
+        let sr = vocals.sample_rate as f64;
+        let mut out: Vec<AlignedWord> = Vec::new();
+
+        for (i, phrase) in phrases.iter().enumerate() {
+            if phrase.words.is_empty() {
+                continue;
+            }
+            let start = phrase.time_sec.max(0.0).min(total_dur);
+            // Strict phrase window end — where the NEXT phrase begins (or song end).
+            let phrase_end = phrases
+                .get(i + 1)
+                .map(|p| p.time_sec.min(total_dur))
+                .unwrap_or(total_dur);
+            // Extended audio buffer end for DTW context.
+            let sub_end = (phrase_end + dtw_pad_sec).min(total_dur);
+            if phrase_end <= start + 0.05 {
+                // degenerate window — place words at the phrase start with zero dur
+                for w in &phrase.words {
+                    out.push(AlignedWord {
+                        word: w.clone(),
+                        normalized: normalize_word(w).join(" "),
+                        start,
+                        end: start + 0.05,
+                        confidence: 0.1,
+                    });
+                }
+                continue;
+            }
+
+            let s_idx = (start * sr) as usize;
+            let e_idx = ((sub_end * sr) as usize).min(vocals.samples.len());
+            if e_idx <= s_idx {
+                continue;
+            }
+
+            // Detect the vocal offset inside the sub-buffer.  Long LRC phrase
+            // windows can include non-vocal interludes (e.g. guitar solos),
+            // so the effective end is the earlier of (phrase_end, vocal_end).
+            // Without this clamp DTW spreads words across the whole silent
+            // tail, dragging the true last word far past its real onset.
+            let (_sub_onset, sub_vocal_end) =
+                detect_vocal_range(&vocals.samples[s_idx..e_idx], vocals.sample_rate);
+            let vocal_end_abs = (start + sub_vocal_end + 0.3).min(sub_end);
+            let effective_end = vocal_end_abs.min(sub_end).max(start + 0.5);
+            let new_e_idx = ((effective_end * sr) as usize).min(vocals.samples.len());
+
+            let sub = AudioBuffer {
+                samples: vocals.samples[s_idx..new_e_idx].to_vec(),
+                sample_rate: vocals.sample_rate,
+            };
+            let lyrics = phrase.words.join(" ");
+            let aligned = self.align(&sub, &lyrics)?;
+            // Strict output window = min(phrase_end, vocal_end).  Caps last
+            // word so it can't bleed into the next phrase AND prevents DTW
+            // from placing words in the instrumental tail.
+            let strict_end = phrase_end.min(effective_end);
+            let window = (strict_end - start).max(0.05);
+
+            for mut w in aligned {
+                let s_local = w.start.clamp(0.0, window - 0.02);
+                let e_local = w.end.clamp(s_local + 0.02, window);
+                w.start = start + s_local;
+                w.end = start + e_local;
+                out.push(w);
+            }
+        }
+
+        // Enforce global monotonicity in case a per-phrase end overlaps the next
+        // phrase's earliest word (rare, but possible with aggressive back-shift).
+        let mut cursor = 0.0_f64;
+        for w in out.iter_mut() {
+            if w.start < cursor {
+                w.start = cursor;
+            }
+            if w.end < w.start + 0.02 {
+                w.end = w.start + 0.02;
+            }
+            cursor = w.start;
+        }
+
+        Ok(out)
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
@@ -351,6 +490,56 @@ impl ForcedAligner {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Detect the first and last time (seconds) where vocal energy exceeds a
+/// relative threshold.  Operates on the separated vocals track, so the only
+/// energy present is from singing.  Used to crop the proportional token-to-
+/// chunk split to the actual vocal range and avoid placing late words in
+/// post-vocal silence.
+fn detect_vocal_range(samples: &[f32], sample_rate: u32) -> (f64, f64) {
+    let win_samples = (sample_rate as usize / 10).max(1); // 100 ms windows
+    let rms: Vec<f32> = samples
+        .chunks(win_samples)
+        .map(|w| {
+            let s: f32 = w.iter().map(|x| x * x).sum();
+            (s / w.len() as f32).sqrt()
+        })
+        .collect();
+
+    if rms.is_empty() {
+        return (0.0, samples.len() as f64 / sample_rate as f64);
+    }
+
+    // Threshold relative to 95th-percentile RMS (robust to impulse peaks).
+    // Vocal-separation residuals sit at roughly 10–15% of typical vocal RMS,
+    // so 15% of p95 cleanly excludes them while keeping all real singing.
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = sorted[((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1)];
+    let thr = p95 * 0.15;
+
+    // Smooth: require a majority of a 5-window (500 ms) neighborhood to exceed
+    // threshold — long enough to reject isolated bleed spikes, short enough to
+    // catch quiet onset syllables.
+    let n = rms.len();
+    let mut smoothed = vec![false; n];
+    let win = 5usize;
+    let half = win / 2;
+    for i in 0..n {
+        let lo = i.saturating_sub(half);
+        let hi = (i + half + 1).min(n);
+        smoothed[i] = rms[lo..hi].iter().filter(|&&v| v > thr).count() >= win / 2 + 1;
+    }
+
+    let first = smoothed.iter().position(|&v| v).unwrap_or(0);
+    let last = smoothed.iter().rposition(|&v| v).unwrap_or(n - 1);
+
+    let win_sec = win_samples as f64 / sample_rate as f64;
+    let onset = first as f64 * win_sec;
+    // Add one window past last active so the final word isn't cut off.
+    let offset = ((last + 1) as f64 * win_sec).min(samples.len() as f64 / sample_rate as f64);
+    (onset, offset)
+}
 
 fn n_mels_for(model: &WhisperModel) -> usize {
     match model {
@@ -517,6 +706,84 @@ fn mean_attention(
         .filter_map(|f| row.get(f).copied())
         .sum();
     (sum / n as f32).clamp(0.0, 1.0)
+}
+
+/// When a song has a long instrumental intro the DTW (0,0) start constraint
+/// anchors the first few lyrics words in the intro music instead of at the
+/// real vocal onset.  This shows up as a large forward jump between word k
+/// and word k+1 (e.g. words 0-1 at 1.5 s, word 2 at 15 s).
+///
+/// Detect that pattern and back-extrapolate the outlier run from the first
+/// trustworthy anchor, using the local average gap of the following words as
+/// the per-word step.
+fn fix_leading_outliers(times: &mut [Option<(f64, f64, f32)>]) {
+    const JUMP_THRESHOLD_S: f64 = 3.0;
+    const LOOK_AHEAD: usize = 5;
+
+    let n = times.len();
+
+    // Find the first large forward jump within the first 10 words.
+    let search_end = n.saturating_sub(1).min(10);
+    for jump_at in 0..search_end {
+        let Some((s_before, _, _)) = times[jump_at] else { continue };
+        let Some((s_after, _, _)) = times[jump_at + 1] else { continue };
+
+        if s_after - s_before < JUMP_THRESHOLD_S {
+            continue;
+        }
+
+        // Identify the contiguous outlier run ending at jump_at (all close together).
+        let mut run_start = jump_at;
+        while run_start > 0 {
+            match (times[run_start - 1], times[run_start]) {
+                (Some((sp, _, _)), Some((sc, _, _))) if sc - sp < JUMP_THRESHOLD_S => {
+                    run_start -= 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Guard: only treat as outlier if the entire run is tightly clustered
+        // relative to the jump.  A natural inter-phrase pause (song2: words 0-7
+        // span 1.7 s then jump 3.8 s to next phrase) has a large cluster/jump
+        // ratio and should NOT be corrected.  A real intro-drag outlier (song3:
+        // words 0-1 span 0.2 s then jump 13.5 s) has a tiny ratio.
+        let run_span = match (times[run_start], times[jump_at]) {
+            (Some((a, _, _)), Some((b, _, _))) => (b - a).abs(),
+            _ => 0.0,
+        };
+        let jump_size = s_after - s_before;
+        if run_span / jump_size > 0.20 {
+            // Cluster is too spread out — this looks like a real phrase gap, not
+            // a DTW start-drag outlier.
+            continue;
+        }
+
+        // Estimate per-word step from the words immediately after the jump.
+        let end = (jump_at + 1 + LOOK_AHEAD).min(n);
+        let after: Vec<f64> = times[jump_at + 1..end]
+            .iter()
+            .filter_map(|t| t.map(|(s, _, _)| s))
+            .collect();
+        let local_gap = if after.len() >= 2 {
+            (after.last().unwrap() - after[0]) / (after.len() - 1) as f64
+        } else {
+            0.200
+        };
+
+        // Back-extrapolate: word run_end is 1 step before s_after, etc.
+        for (rank, idx) in (run_start..=jump_at).rev().enumerate() {
+            let offset = (rank + 1) as f64;
+            let new_s = (s_after - offset * local_gap).max(0.0);
+            if let Some((old_s, old_e, c)) = times[idx] {
+                let dur = (old_e - old_s).max(0.02);
+                times[idx] = Some((new_s, new_s + dur, c));
+            }
+        }
+
+        // Only fix the first large jump.
+        break;
+    }
 }
 
 fn build_empty_output(words: &[String]) -> Vec<AlignedWord> {

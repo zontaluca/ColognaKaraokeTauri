@@ -47,6 +47,7 @@ dependencies = [
  "dirs-next",
  "hf-hub",
  "hound",
+ "regex",
  "rubato",
  "rustfft",
  "serde",

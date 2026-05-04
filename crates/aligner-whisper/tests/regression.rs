@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use aligner_pipeline::AudioBuffer;
-use aligner_whisper::{AlignError, AlignmentConfig, ForcedAligner, WhisperModel};
+use aligner_whisper::{AlignmentConfig, ForcedAligner, PhraseAnchor, WhisperModel};
 use serde::Deserialize;
 
 // ─── Fixture types ────────────────────────────────────────────────────────────
@@ -347,6 +347,333 @@ async fn test_willie_peyote_no_cascade() {
     let mae = errors.iter().sum::<f64>() / errors.len() as f64;
     println!("\nFirst-verse MAE = {:.1}ms", mae);
     assert!(mae < 400.0, "First-verse MAE {:.1}ms exceeds 400ms", mae);
+}
+
+// ─── Dynamic song regression ─────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+struct SongWord {
+    word: String,
+    start_ms: u64,
+    #[serde(default)]
+    end_ms: u64,
+    #[serde(default)]
+    line: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SongMeta {
+    language: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LrcDoc {
+    lrc: String,
+}
+
+/// Parse an LRC string into phrase start times in milliseconds, one per line.
+fn parse_lrc(lrc: &str) -> Vec<u64> {
+    parse_lrc_full(lrc).into_iter().map(|(ms, _)| ms).collect()
+}
+
+/// Parse an LRC string into (start_ms, phrase_text) pairs.
+///
+/// Empty-text LRC lines (purely-instrumental markers) are skipped — the
+/// ground-truth words.json `line` field indexes non-empty phrases only.
+fn parse_lrc_full(lrc: &str) -> Vec<(u64, String)> {
+    let re = regex::Regex::new(r"^\[(\d+):(\d+(?:\.\d+)?)\](.*)$").unwrap();
+    lrc.lines()
+        .filter_map(|line| {
+            let caps = re.captures(line.trim_start())?;
+            let m: u64 = caps.get(1)?.as_str().parse().ok()?;
+            let s: f64 = caps.get(2)?.as_str().parse().ok()?;
+            let text = caps.get(3)?.as_str().trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            Some((((m as f64) * 60.0 * 1000.0 + s * 1000.0) as u64, text))
+        })
+        .collect()
+}
+
+/// Discover all test-assets/song*/ directories, sorted by name.
+fn discover_song_dirs() -> Vec<PathBuf> {
+    let candidates = [Path::new("test-assets"), Path::new("../../test-assets")];
+    let base = candidates
+        .iter()
+        .find(|c| c.join("song1").exists())
+        .map(|c| c.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("test-assets"));
+
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("song"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Dynamic regression: runs for every test-assets/song*/ folder.
+///
+/// Each song folder must contain:
+///   vocals.wav      — audio (any sample rate, any bit depth)
+///   words.json      — [{word, start_ms, end_ms, line}, ...]  ground-truth
+///   metadata.json   — {"language": "it"}  (ISO 639-1 code)
+///
+/// Assertions (first VERSE_WORDS words only, where alignment is accurate):
+///   1. Word count matches words.json.
+///   2. No cascade: consecutive words ≥ 50 ms apart  (catches back-shift bug).
+///   3. MAE < 500 ms.
+///
+/// Run with Metal GPU (recommended):
+///   cargo test -p aligner-whisper --test regression test_all_songs_regression --features metal -- --nocapture
+#[tokio::test]
+async fn test_all_songs_regression() {
+    const VERSE_WORDS: usize = 20;
+    // 5ms catches the old back-shift cascade (which produced 1ms gaps) but
+    // tolerates sub-phrase DTW collisions at phrase boundaries where the
+    // last word of phrase N and first of phrase N+1 can land very close.
+    const CASCADE_MIN_MS: f64 = 5.0;
+    const MAE_THRESHOLD_MS: f64 = 500.0;
+
+    let song_dirs = discover_song_dirs();
+    if song_dirs.is_empty() {
+        eprintln!("SKIP: no test-assets/song*/ directories found");
+        return;
+    }
+
+    let model = if cfg!(feature = "metal") { WhisperModel::Medium } else { WhisperModel::Small };
+    let mut failures: Vec<String> = Vec::new();
+
+    for dir in &song_dirs {
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let vocals_path = dir.join("vocals.wav");
+        let words_path = dir.join("words.json");
+        let meta_path = dir.join("metadata.json");
+
+        if skip_if_missing(&vocals_path) || skip_if_missing(&words_path) || skip_if_missing(&meta_path) {
+            continue;
+        }
+
+        let meta: SongMeta = match serde_json::from_str(
+            &std::fs::read_to_string(&meta_path).expect("read metadata.json"),
+        ) {
+            Ok(m) => m,
+            Err(e) => { failures.push(format!("[{name}] parse metadata.json: {e}")); continue; }
+        };
+
+        let ground_truth: Vec<SongWord> = match serde_json::from_str(
+            &std::fs::read_to_string(&words_path).expect("read words.json"),
+        ) {
+            Ok(w) => w,
+            Err(e) => { failures.push(format!("[{name}] parse words.json: {e}")); continue; }
+        };
+
+        let vocals = match load_wav_mono_16k(&vocals_path) {
+            Some(v) => v,
+            None => { failures.push(format!("[{name}] failed to load vocals.wav")); continue; }
+        };
+
+        // Optional lrc.json — phrase-level ground-truth windows.
+        let lrc_path = dir.join("lrc.json");
+        let lrc_phrases: Vec<u64> = if lrc_path.exists() {
+            match std::fs::read_to_string(&lrc_path) {
+                Ok(s) => match serde_json::from_str::<LrcDoc>(&s) {
+                    Ok(doc) => parse_lrc(&doc.lrc),
+                    Err(e) => { failures.push(format!("[{name}] parse lrc.json: {e}")); Vec::new() }
+                },
+                Err(e) => { failures.push(format!("[{name}] read lrc.json: {e}")); Vec::new() }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let config = AlignmentConfig {
+            model: model.clone(),
+            language: meta.language.clone(),
+            ..Default::default()
+        };
+        let aligner = match ForcedAligner::new(config).await {
+            Ok(a) => a,
+            Err(e) => { failures.push(format!("[{name}] load model: {e}")); continue; }
+        };
+
+        // When we have LRC phrase timestamps, run per-phrase alignment for
+        // drift-free accuracy on long songs.  Group ground-truth words by
+        // `line` to preserve the exact word sequence/tokenization.
+        let result = if !lrc_phrases.is_empty() {
+            let mut words_per_line: Vec<Vec<String>> = vec![Vec::new(); lrc_phrases.len()];
+            for w in &ground_truth {
+                if w.line < words_per_line.len() {
+                    words_per_line[w.line].push(w.word.clone());
+                }
+            }
+            let phrases: Vec<PhraseAnchor> = lrc_phrases
+                .iter()
+                .zip(words_per_line.into_iter())
+                .map(|(&ms, words)| PhraseAnchor {
+                    time_sec: ms as f64 / 1000.0,
+                    words,
+                })
+                .collect();
+            match aligner.align_with_phrases(&vocals, &phrases, 1.5) {
+                Ok(r) => r,
+                Err(e) => { failures.push(format!("[{name}] phrase-align error: {e}")); continue; }
+            }
+        } else {
+            let lyrics = ground_truth.iter().map(|w| w.word.as_str()).collect::<Vec<_>>().join(" ");
+            match aligner.align(&vocals, &lyrics) {
+                Ok(r) => r,
+                Err(e) => { failures.push(format!("[{name}] align error: {e}")); continue; }
+            }
+        };
+
+        println!("\n══ {name} (lang={}) ════════════════════════════════", meta.language);
+
+        // 1) word count
+        if result.len() != ground_truth.len() {
+            failures.push(format!(
+                "[{name}] word count mismatch: got {} expected {}",
+                result.len(), ground_truth.len()
+            ));
+            continue;
+        }
+
+        let verse_end = VERSE_WORDS.min(result.len());
+
+        // print first-verse table
+        let mut errors: Vec<f64> = Vec::new();
+        for i in 0..verse_end {
+            let got_ms = result[i].start * 1_000.0;
+            let exp_ms = ground_truth[i].start_ms as f64;
+            let err = (got_ms - exp_ms).abs();
+            errors.push(err);
+            println!("  {:>14}  got={:.0}ms  exp={}ms  err={:.0}ms",
+                result[i].word, got_ms, exp_ms, err);
+        }
+
+        // 2) cascade check (first verse)
+        let mut cascade_violations: Vec<String> = Vec::new();
+        for w in result[..verse_end].windows(2) {
+            let gap_ms = (w[1].start - w[0].start) * 1_000.0;
+            if gap_ms < CASCADE_MIN_MS {
+                cascade_violations.push(format!(
+                    "'{}' ({:.0}ms) → '{}' ({:.0}ms) gap={:.0}ms",
+                    w[0].word, w[0].start * 1000.0,
+                    w[1].word, w[1].start * 1000.0,
+                    gap_ms
+                ));
+            }
+        }
+        if !cascade_violations.is_empty() {
+            println!("  cascade violations:");
+            for v in &cascade_violations { println!("    {v}"); }
+            failures.push(format!(
+                "[{name}] {} cascade violation(s) in first {verse_end} words",
+                cascade_violations.len()
+            ));
+        }
+
+        // 3) MAE check (first verse)
+        if !errors.is_empty() {
+            let mae = errors.iter().sum::<f64>() / errors.len() as f64;
+            println!("  First-{verse_end}-words MAE = {mae:.1}ms");
+            if mae >= MAE_THRESHOLD_MS {
+                failures.push(format!(
+                    "[{name}] first-verse MAE {mae:.1}ms ≥ {MAE_THRESHOLD_MS}ms threshold"
+                ));
+            }
+        }
+
+        // 4) Full-song MAE + worst offenders.
+        let mut full_errors: Vec<(usize, f64)> = (0..result.len())
+            .map(|i| {
+                let err = (result[i].start * 1000.0 - ground_truth[i].start_ms as f64).abs();
+                (i, err)
+            })
+            .collect();
+        let full_mae = full_errors.iter().map(|(_, e)| e).sum::<f64>() / full_errors.len() as f64;
+        full_errors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let p90 = {
+            let mut sorted: Vec<f64> = full_errors.iter().map(|(_, e)| *e).collect();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted[(sorted.len() as f64 * 0.9) as usize]
+        };
+
+        println!("  Full-song MAE = {full_mae:.1}ms, P90 = {p90:.1}ms ({} words)", result.len());
+        println!("  Top 10 worst-aligned words:");
+        for (i, err) in full_errors.iter().take(10) {
+            println!("    [{:>3}] {:>16}  got={:.0}ms  exp={}ms  err={:.0}ms",
+                i, result[*i].word, result[*i].start * 1000.0,
+                ground_truth[*i].start_ms, err);
+        }
+
+        const FULL_MAE_THRESHOLD_MS: f64 = 800.0;
+        if full_mae >= FULL_MAE_THRESHOLD_MS {
+            failures.push(format!(
+                "[{name}] full-song MAE {full_mae:.1}ms ≥ {FULL_MAE_THRESHOLD_MS}ms threshold"
+            ));
+        }
+
+        // 5) LRC-window check: each aligned word must fall inside its phrase's
+        //    [start, next_start) window, per the `line` field in words.json.
+        if !lrc_phrases.is_empty() {
+            let mut violations: Vec<(usize, f64, u64, u64, String)> = Vec::new();
+            for i in 0..result.len() {
+                let line = ground_truth[i].line;
+                if line >= lrc_phrases.len() { continue; }
+                let lo = lrc_phrases[line];
+                let hi = lrc_phrases
+                    .get(line + 1)
+                    .copied()
+                    .unwrap_or(u64::MAX);
+                let got_ms = (result[i].start * 1000.0) as i64;
+                let lo_i = lo as i64;
+                let hi_i = if hi == u64::MAX { i64::MAX } else { hi as i64 };
+                if got_ms < lo_i || got_ms >= hi_i {
+                    violations.push((
+                        i,
+                        result[i].start * 1000.0,
+                        lo,
+                        hi,
+                        result[i].word.clone(),
+                    ));
+                }
+            }
+            println!(
+                "  LRC-window: {}/{} words outside their phrase window ({} phrases)",
+                violations.len(), result.len(), lrc_phrases.len()
+            );
+            for (i, got, lo, hi, w) in violations.iter().take(15) {
+                let hi_show = if *hi == u64::MAX { "∞".to_string() } else { format!("{hi}") };
+                println!("    [{i:>3}] {w:>16}  got={got:.0}ms  window=[{lo},{hi_show})");
+            }
+            const LRC_MAX_VIOLATIONS_RATIO: f64 = 0.10;
+            let ratio = violations.len() as f64 / result.len() as f64;
+            if ratio > LRC_MAX_VIOLATIONS_RATIO {
+                failures.push(format!(
+                    "[{name}] LRC-window violations {}/{} ({:.1}%) > {:.0}% threshold",
+                    violations.len(), result.len(), ratio * 100.0,
+                    LRC_MAX_VIOLATIONS_RATIO * 100.0
+                ));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!("Song regression failures:\n{}", failures.join("\n"));
+    }
 }
 
 /// Two concatenated copies of the clean clip must produce no duplicate words

@@ -7,16 +7,39 @@
 /// Run DTW and return the optimal path as (token_idx, frame_idx) pairs.
 ///
 /// `cost` must be non-empty and rectangular. Allowed steps: diagonal, down,
-/// right (standard DTW).
+/// right (standard DTW). Path is constrained to start at (0,0).
 pub fn dtw(cost: &[Vec<f32>]) -> Vec<(usize, usize)> {
+    dtw_impl(cost, false)
+}
+
+/// Free-start DTW: the path may begin at any frame in row 0, not just frame 0.
+///
+/// Use this when there may be a long non-vocal prefix in the audio (e.g. an
+/// instrumental intro) — the first token finds its true attention peak instead
+/// of being dragged to frame 0 by the (0,0) start constraint.
+pub fn dtw_free_start(cost: &[Vec<f32>]) -> Vec<(usize, usize)> {
+    dtw_impl(cost, true)
+}
+
+fn dtw_impl(cost: &[Vec<f32>], free_start: bool) -> Vec<(usize, usize)> {
     let n = cost.len();
     let m = cost[0].len();
 
     let mut dp = vec![vec![f32::INFINITY; m]; n];
-    dp[0][0] = cost[0][0];
-    for j in 1..m {
-        dp[0][j] = dp[0][j - 1] + cost[0][j];
+
+    if free_start {
+        // No accumulation penalty in the first row: every frame is an equally
+        // valid starting point for the first token.
+        for j in 0..m {
+            dp[0][j] = cost[0][j];
+        }
+    } else {
+        dp[0][0] = cost[0][0];
+        for j in 1..m {
+            dp[0][j] = dp[0][j - 1] + cost[0][j];
+        }
     }
+
     for i in 1..n {
         dp[i][0] = dp[i - 1][0] + cost[i][0];
     }
@@ -27,15 +50,25 @@ pub fn dtw(cost: &[Vec<f32>]) -> Vec<(usize, usize)> {
         }
     }
 
-    // Traceback from (n-1, m-1) to (0, 0).
+    // Traceback from (n-1, m-1).
+    // With free_start the path may end anywhere in row 0; without it we
+    // continue left until (0,0) as usual.
     let mut path = Vec::with_capacity(n + m);
     let mut i = n - 1;
     let mut j = m - 1;
     path.push((i, j));
-    while i > 0 || j > 0 {
+    loop {
         if i == 0 {
-            j -= 1;
-        } else if j == 0 {
+            if !free_start {
+                // Standard mode: consume remaining frames in row 0.
+                while j > 0 {
+                    j -= 1;
+                    path.push((0, j));
+                }
+            }
+            break;
+        }
+        if j == 0 {
             i -= 1;
         } else {
             let diag = dp[i - 1][j - 1];
