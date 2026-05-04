@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 
 const CK_GRADIENT = "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)";
 
@@ -8,15 +8,16 @@ function formatDate(ts) {
   return new Date(ts * 1000).toLocaleDateString("it-IT");
 }
 
-function Avatar({ name }) {
+function Avatar({ name, photo, size = 24 }) {
   const hue = [...(name || "?")].reduce((a, c) => a + c.charCodeAt(0), 0) * 37 % 360;
+  const src = photo ? convertFileSrc(photo) : null;
   return (
     <div style={{
-      width: 24, height: 24, borderRadius: "50%", flexShrink: 0,
-      background: `hsl(${hue}, 70%, 55%)`,
-      fontSize: 10, fontWeight: 700, color: "#FFF",
+      width: size, height: size, borderRadius: "50%", flexShrink: 0,
+      background: src ? `url(${src}) center/cover no-repeat` : `hsl(${hue}, 70%, 55%)`,
+      fontSize: size * 0.42, fontWeight: 700, color: "#FFF",
       display: "flex", alignItems: "center", justifyContent: "center",
-    }}>{(name || "?")[0]}</div>
+    }}>{!src && (name || "?")[0]}</div>
   );
 }
 
@@ -43,12 +44,14 @@ function Podium({ entries }) {
           <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, width: 180 }}>
             <div style={{
               width: isFirst ? 56 : 44, height: isFirst ? 56 : 44, borderRadius: "50%",
-              background: `hsl(${i * 120}, 70%, 55%)`,
+              background: e.photo_path
+                ? `url(${convertFileSrc(e.photo_path)}) center/cover no-repeat`
+                : `hsl(${i * 120}, 70%, 55%)`,
               display: "flex", alignItems: "center", justifyContent: "center",
               fontSize: isFirst ? 20 : 16, fontWeight: 700, color: "#FFF",
               border: `3px solid ${tints[i]}`,
               boxShadow: `0 8px 20px hsl(${i * 120}, 70%, 55%, 0.35)`,
-            }}>{e.player_name?.[0] || "?"}</div>
+            }}>{!e.photo_path && (e.player_name?.[0] || "?")}</div>
             <div style={{ textAlign: "center" }}>
               <div style={{ fontSize: 13, fontWeight: 700, color: "#FFF" }}>{e.player_name}</div>
               <div style={{ fontSize: 10.5, color: "rgba(237,233,255,0.5)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160 }}>{e.song_title}</div>
@@ -91,7 +94,7 @@ function LeaderboardRow({ entry, idx }) {
         {String(idx + 1).padStart(2, "0")}
       </span>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <Avatar name={entry.player_name}/>
+        <Avatar name={entry.player_name} photo={entry.photo_path}/>
         <span style={{ fontWeight: 600, color: "#FFF", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.player_name}</span>
       </div>
       <span style={{ color: "rgba(237,233,255,0.7)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.song_title}</span>

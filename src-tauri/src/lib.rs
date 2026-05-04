@@ -8,6 +8,7 @@ mod lyrics;
 mod metadata;
 mod pipeline;
 mod pitch;
+mod players;
 mod recorder;
 mod recognizer;
 mod separator;
@@ -43,6 +44,13 @@ pub fn run() {
             leaderboard::leaderboard_insert,
             leaderboard::leaderboard_top,
             leaderboard::leaderboard_global_top,
+            players::players_list,
+            players::players_get,
+            players::players_create,
+            players::players_update,
+            players::players_delete,
+            players::players_stats,
+            players::players_history,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
