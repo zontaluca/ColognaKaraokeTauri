@@ -402,15 +402,32 @@ impl ForcedAligner {
                 continue;
             }
 
-            // Detect the vocal offset inside the sub-buffer.  Long LRC phrase
-            // windows can include non-vocal interludes (e.g. guitar solos),
-            // so the effective end is the earlier of (phrase_end, vocal_end).
-            // Without this clamp DTW spreads words across the whole silent
-            // tail, dragging the true last word far past its real onset.
-            let (_sub_onset, sub_vocal_end) =
+            // Compute two vocal-end estimates over the sub-buffer:
+            //   • last_vocal — last frame above the RMS threshold.
+            //   • first_seg_end — end of the FIRST contiguous vocal block,
+            //     cut by the first ≥ 800 ms silence.
+            //
+            // Decision: if the first segment alone is long enough to host
+            // the phrase's word count at a reasonable pace (≥ 300 ms/word),
+            // trust first_seg_end — this trims an instrumental tail that
+            // follows the lyrics (e.g. song3 line 19 + 14 s guitar solo).
+            // Otherwise the phrase lyrics span multiple vocal segments
+            // (e.g. song4 "Yeah … let's go … ha-ha-ha" with 1 s gaps),
+            // and we must use last_vocal so they can all be placed.
+            let (_sub_onset, last_vocal_local) =
                 detect_vocal_range(&vocals.samples[s_idx..e_idx], vocals.sample_rate);
-            let vocal_end_abs = (start + sub_vocal_end + 0.3).min(sub_end);
-            let effective_end = vocal_end_abs.min(sub_end).max(start + 0.5);
+            let first_seg_end_local = find_first_vocal_segment_end(
+                &vocals.samples[s_idx..e_idx],
+                vocals.sample_rate,
+            );
+            let min_required_dur = phrase.words.len() as f64 * 0.30;
+            let vocal_end_local = if first_seg_end_local >= min_required_dur {
+                first_seg_end_local
+            } else {
+                last_vocal_local
+            };
+            let vocal_end_abs = (start + vocal_end_local + 0.2).min(sub_end);
+            let effective_end = vocal_end_abs.max(start + 0.5);
             let new_e_idx = ((effective_end * sr) as usize).min(vocals.samples.len());
 
             let sub = AudioBuffer {
@@ -419,10 +436,10 @@ impl ForcedAligner {
             };
             let lyrics = phrase.words.join(" ");
             let aligned = self.align(&sub, &lyrics)?;
-            // Strict output window = min(phrase_end, vocal_end).  Caps last
-            // word so it can't bleed into the next phrase AND prevents DTW
-            // from placing words in the instrumental tail.
-            let strict_end = phrase_end.min(effective_end);
+            // Output window follows detected vocal segment, not raw LRC marker.
+            // Global monotonicity cursor below prevents overlap with the next
+            // phrase even when this phrase extends past its LRC end.
+            let strict_end = effective_end;
             let window = (strict_end - start).max(0.05);
 
             for mut w in aligned {
@@ -539,6 +556,71 @@ fn detect_vocal_range(samples: &[f32], sample_rate: u32) -> (f64, f64) {
     // Add one window past last active so the final word isn't cut off.
     let offset = ((last + 1) as f64 * win_sec).min(samples.len() as f64 / sample_rate as f64);
     (onset, offset)
+}
+
+/// Find the end (in seconds) of the FIRST contiguous vocal segment in
+/// `samples`.  A "gap" is ≥ 800 ms of consecutive 100 ms windows whose RMS
+/// falls below 15 % of the p95 RMS — same threshold as `detect_vocal_range`.
+///
+/// Used by phrase-level alignment to:
+///   • Shrink the output window when an instrumental tail follows the vocal.
+///   • Extend the output window past an LRC marker that is set too early.
+///
+/// Returns the buffer duration when no gap is found (vocal continuous to
+/// the end of the sub-buffer).
+fn find_first_vocal_segment_end(samples: &[f32], sample_rate: u32) -> f64 {
+    let win_samples = (sample_rate as usize / 10).max(1); // 100 ms
+    let rms: Vec<f32> = samples
+        .chunks(win_samples)
+        .map(|w| {
+            let s: f32 = w.iter().map(|x| x * x).sum();
+            (s / w.len() as f32).sqrt()
+        })
+        .collect();
+    let total_dur = samples.len() as f64 / sample_rate as f64;
+    if rms.is_empty() {
+        return total_dur;
+    }
+
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = sorted[((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1)];
+    let thr = p95 * 0.15;
+
+    let win_sec = win_samples as f64 / sample_rate as f64;
+    // 800 ms minimum gap to flag as instrumental break.  Inter-word gaps in
+    // pop vocals are typically < 500 ms (e.g. 241 ms between "Ey," and
+    // "Tití" — 3 windows below threshold), so a 300 ms threshold produces
+    // false positives mid-phrase.  Real solo / interlude gaps are ≥ 1 s.
+    const GAP_WINDOWS: usize = 8; // 800 ms
+
+    // Skip leading silence to locate vocal onset.
+    let n = rms.len();
+    let mut i = 0;
+    while i < n && rms[i] <= thr {
+        i += 1;
+    }
+    if i >= n {
+        return total_dur;
+    }
+
+    // Walk through vocal block; declare end at first ≥ GAP_WINDOWS run of
+    // sub-threshold windows.
+    while i < n {
+        if rms[i] <= thr {
+            let mut k = i;
+            while k < n && rms[k] <= thr {
+                k += 1;
+            }
+            if k - i >= GAP_WINDOWS {
+                return (i as f64 * win_sec).min(total_dur);
+            }
+            i = k;
+        } else {
+            i += 1;
+        }
+    }
+    total_dur
 }
 
 fn n_mels_for(model: &WhisperModel) -> usize {
