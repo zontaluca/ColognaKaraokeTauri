@@ -707,3 +707,324 @@ async fn test_no_duplicate_at_chunk_boundary() {
     let expected_len = lyrics_double.split_whitespace().count();
     assert_eq!(result.len(), expected_len, "word count mismatch on doubled clip");
 }
+
+// ─── Manual LRC test (manual-test-assets/song1) ─────────────────────────────
+
+/// Decode any audio file (mp3/wav/aac/m4a) → mono 16 kHz f32 via symphonia.
+fn decode_mono_16k(path: &Path) -> Option<AudioBuffer> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let src = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .ok()?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)?
+        .clone();
+    let src_rate = track.codec_params.sample_rate.unwrap_or(44_100);
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
+    let track_id = track.id;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .ok()?;
+
+    let mut mono: Vec<f32> = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(_) => break,
+        };
+        if packet.track_id() != track_id { continue; }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(_) => break,
+        };
+        let spec = *decoded.spec();
+        let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buf.copy_interleaved_ref(decoded);
+        for chunk in buf.samples().chunks(channels) {
+            let s: f32 = chunk.iter().sum::<f32>() / channels as f32;
+            mono.push(s);
+        }
+    }
+    if mono.is_empty() { return None; }
+
+    let samples = if src_rate == 16_000 {
+        mono
+    } else {
+        use rubato::{
+            Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
+            WindowFunction,
+        };
+        let params = SincInterpolationParameters {
+            sinc_len: 128,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 128,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let ratio = 16_000.0 / src_rate as f64;
+        let mut rs = SincFixedIn::<f32>::new(ratio, 2.0, params, mono.len(), 1).ok()?;
+        let out = rs.process(&[mono], None).ok()?;
+        out.into_iter().next()?
+    };
+    Some(AudioBuffer { samples, sample_rate: 16_000 })
+}
+
+/// One LRC phrase parsed from the inline-timestamps format.
+#[derive(Debug, Clone)]
+struct InlinePhrase {
+    /// Phrase start in milliseconds (the leading `[mm:ss.fff]` tag).
+    line_start_ms: u64,
+    /// Per-word ground truth: (word, start_ms, end_ms).
+    words: Vec<(String, u64, u64)>,
+}
+
+fn ts_to_ms(s: &str) -> Option<u64> {
+    // Accepts "MM:SS.fff" or "MM:SS.ffff"; tolerates trailing junk in fraction.
+    let mut parts = s.splitn(2, ':');
+    let mm: u64 = parts.next()?.parse().ok()?;
+    let rest = parts.next()?;
+    let secs: f64 = rest.parse().ok()?;
+    Some(((mm as f64) * 60.0 * 1000.0 + secs * 1000.0) as u64)
+}
+
+/// Parse Aegisub-style inline-timestamps LRC:
+///   [00:14.601] The <00:14.842> praia <00:15.277> in <00:15.575> ...
+/// The leading bracket sets line start AND first word start. Each `<...>`
+/// is the END of the preceding word AND start of the next word.
+fn parse_inline_lrc(lrc: &str) -> Vec<InlinePhrase> {
+    let line_re = regex::Regex::new(r"^\[(\d+:\d+(?:\.\d+)?)\](.*)$").unwrap();
+    let inline_re = regex::Regex::new(r"<(\d+:\d+(?:\.\d+)?)>").unwrap();
+    let mut out = Vec::new();
+    for raw in lrc.lines() {
+        let line = raw.trim();
+        let Some(caps) = line_re.captures(line) else { continue };
+        let line_start_ms = match ts_to_ms(caps.get(1).unwrap().as_str()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let body = caps.get(2).unwrap().as_str().trim();
+        if body.is_empty() {
+            continue; // pure-instrumental anchor
+        }
+
+        // Walk the body: split by inline `<...>` markers; tokens between them
+        // are word(s).  word_starts is parallel to words; word_ends is shifted.
+        let mut tokens: Vec<&str> = Vec::new();
+        let mut times: Vec<u64> = vec![line_start_ms];
+        let mut cursor = 0usize;
+        for m in inline_re.find_iter(body) {
+            let segment = body[cursor..m.start()].trim();
+            if !segment.is_empty() { tokens.push(segment); }
+            if let Some(c) = inline_re.captures(m.as_str()) {
+                if let Some(t) = ts_to_ms(c.get(1).unwrap().as_str()) {
+                    times.push(t);
+                }
+            }
+            cursor = m.end();
+        }
+        let tail = body[cursor..].trim();
+        if !tail.is_empty() { tokens.push(tail); }
+
+        // Each token may contain multiple whitespace-separated words; treat as
+        // one block sharing the same [start, end] and split evenly.  Most LRC
+        // segments have one word, so this is rarely exercised.
+        let mut words: Vec<(String, u64, u64)> = Vec::new();
+        for (i, tok) in tokens.iter().enumerate() {
+            let s = times.get(i).copied().unwrap_or(line_start_ms);
+            let e = times
+                .get(i + 1)
+                .copied()
+                .unwrap_or(s + 200);
+            let parts: Vec<&str> = tok.split_whitespace().collect();
+            if parts.len() == 1 {
+                words.push((parts[0].to_string(), s, e));
+            } else {
+                let span = (e.saturating_sub(s)) as f64 / parts.len() as f64;
+                for (k, w) in parts.iter().enumerate() {
+                    let ws = s + (span * k as f64) as u64;
+                    let we = s + (span * (k + 1) as f64) as u64;
+                    words.push((w.to_string(), ws, we));
+                }
+            }
+        }
+        if !words.is_empty() {
+            out.push(InlinePhrase { line_start_ms, words });
+        }
+    }
+    out
+}
+
+/// Per-line accuracy regression on `manual-test-assets/song1/`.
+///
+/// Audio source is the full-mix mp3 (no separate vocals.wav), so this
+/// exercises the aligner on natural backing-track conditions.  Run with:
+///   cargo test -p aligner-whisper --test regression \
+///     test_manual_assets_song1 --features metal -- --nocapture
+#[tokio::test]
+async fn test_manual_assets_song1() {
+    let candidates = [
+        Path::new("manual-test-assets/song1"),
+        Path::new("../../manual-test-assets/song1"),
+    ];
+    let dir = match candidates.iter().find(|p| p.join("song1.lrc").exists()) {
+        Some(p) => p.to_path_buf(),
+        None => {
+            eprintln!("SKIP: manual-test-assets/song1 not found");
+            return;
+        }
+    };
+    let mp3_path = dir.join("song1.mp3");
+    let lrc_path = dir.join("song1.lrc");
+    if skip_if_missing(&mp3_path) || skip_if_missing(&lrc_path) { return; }
+
+    let lrc_text = std::fs::read_to_string(&lrc_path).expect("read lrc");
+    let phrases = parse_inline_lrc(&lrc_text);
+    assert!(!phrases.is_empty(), "no phrases parsed from LRC");
+
+    let audio = decode_mono_16k(&mp3_path).expect("decode mp3");
+    println!(
+        "audio: {:.1}s @ 16kHz, {} phrases, {} words",
+        audio.samples.len() as f64 / 16_000.0,
+        phrases.len(),
+        phrases.iter().map(|p| p.words.len()).sum::<usize>(),
+    );
+
+    let model = if cfg!(feature = "metal") {
+        WhisperModel::LargeV3Turbo
+    } else {
+        WhisperModel::Small
+    };
+    let config = AlignmentConfig {
+        model,
+        language: "en".to_string(), // English-dominant lyrics, multilingual encoder
+        ..Default::default()
+    };
+    let aligner = ForcedAligner::new(config).await.expect("load model");
+
+    let phrase_anchors: Vec<PhraseAnchor> = phrases
+        .iter()
+        .map(|p| PhraseAnchor {
+            time_sec: p.line_start_ms as f64 / 1000.0,
+            words: p.words.iter().map(|(w, _, _)| w.clone()).collect(),
+        })
+        .collect();
+
+    let result = aligner
+        .align_with_phrases(&audio, &phrase_anchors, 1.5)
+        .expect("align");
+
+    // Flat ground-truth words list parallel to `result`.
+    let gt_words: Vec<(String, u64, u64)> = phrases
+        .iter()
+        .flat_map(|p| p.words.iter().cloned())
+        .collect();
+    assert_eq!(
+        result.len(),
+        gt_words.len(),
+        "word count mismatch: got {}, expected {}",
+        result.len(),
+        gt_words.len(),
+    );
+
+    // ── Per-line summary: first-word start vs LRC line marker.
+    println!("\n══ per-line accuracy ════════════════════════════════════");
+    println!(
+        "{:>4} {:>10} {:>10} {:>9}  {}",
+        "#", "lrc_ms", "got_ms", "err_ms", "phrase",
+    );
+    let mut line_errors: Vec<f64> = Vec::new();
+    let mut word_idx = 0usize;
+    for (i, p) in phrases.iter().enumerate() {
+        let got_ms = result[word_idx].start * 1000.0;
+        let err = (got_ms - p.line_start_ms as f64).abs();
+        line_errors.push(err);
+        let phrase_text: String = p
+            .words
+            .iter()
+            .map(|(w, _, _)| w.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "{:>4} {:>10} {:>10.0} {:>9.0}  {}",
+            i, p.line_start_ms, got_ms, err, phrase_text,
+        );
+        word_idx += p.words.len();
+    }
+
+    let line_mae = line_errors.iter().sum::<f64>() / line_errors.len() as f64;
+    let mut sorted = line_errors.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let line_p90 = sorted[(sorted.len() as f64 * 0.9) as usize];
+    let line_max = sorted.last().copied().unwrap_or(0.0);
+
+    // ── Per-word stats.
+    let mut word_errors: Vec<(usize, String, f64)> = (0..result.len())
+        .map(|i| {
+            let err = (result[i].start * 1000.0 - gt_words[i].1 as f64).abs();
+            (i, gt_words[i].0.clone(), err)
+        })
+        .collect();
+    let word_mae = word_errors.iter().map(|(_, _, e)| e).sum::<f64>()
+        / word_errors.len() as f64;
+    let mut sorted_w: Vec<f64> = word_errors.iter().map(|(_, _, e)| *e).collect();
+    sorted_w.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let word_p90 = sorted_w[(sorted_w.len() as f64 * 0.9) as usize];
+
+    word_errors.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    println!("\n── top 10 worst words ──────────────────────────────────");
+    for (i, w, err) in word_errors.iter().take(10) {
+        println!(
+            "  [{:>3}] {:>16}  got={:.0}ms  exp={}ms  err={:.0}ms",
+            i, w, result[*i].start * 1000.0, gt_words[*i].1, err,
+        );
+    }
+
+    println!(
+        "\nLine MAE = {:.0}ms  P90 = {:.0}ms  Max = {:.0}ms  ({} lines)",
+        line_mae, line_p90, line_max, phrases.len(),
+    );
+    println!(
+        "Word MAE = {:.0}ms  P90 = {:.0}ms  ({} words)",
+        word_mae, word_p90, result.len(),
+    );
+
+    // Reasonable thresholds for full-mix audio; tighten once vocals are
+    // separated.  These guard the obvious regressions (drift, cascade) without
+    // demanding TTS-grade accuracy on a real bilingual song.
+    assert!(
+        line_mae < 600.0,
+        "line MAE {:.0}ms exceeds 600ms threshold",
+        line_mae,
+    );
+    assert!(
+        line_p90 < 1200.0,
+        "line P90 {:.0}ms exceeds 1200ms threshold",
+        line_p90,
+    );
+}

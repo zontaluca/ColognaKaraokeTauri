@@ -103,6 +103,20 @@ impl ForcedAligner {
             return Err(AlignError::BadSampleRate(vocals.sample_rate));
         }
 
+        // Peak-normalize quiet inputs so log-mel doesn't bottom out near the
+        // noise floor (helps full-mix audio with conservative mastering).
+        // Only scale when the recording is meaningfully under unity.
+        let max_abs = vocals.samples.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+        let normalized_samples: Option<Vec<f32>> = if max_abs > 0.0 && max_abs < 0.5 {
+            let scale = 0.95_f32 / max_abs;
+            Some(vocals.samples.iter().map(|s| s * scale).collect())
+        } else {
+            None
+        };
+        let samples_ref: &[f32] = normalized_samples
+            .as_deref()
+            .unwrap_or(&vocals.samples);
+
         let (orig_words, norm_words, norm_map) = normalize_lyrics(lyrics);
         if orig_words.is_empty() {
             return Ok(vec![]);
@@ -150,18 +164,18 @@ impl ForcedAligner {
         ];
 
         let total_dur =
-            vocals.samples.len() as f64 / vocals.sample_rate as f64;
+            samples_ref.len() as f64 / vocals.sample_rate as f64;
 
         // Detect vocal onset/offset using frame-level energy.  Songs often have
         // 10–60 s of instrumental intro/outro; if we use total_dur for the
         // proportional token-to-chunk split, late words get assigned to empty
         // post-vocal chunks and drift massively.  Use active_dur (onset→offset)
         // instead so token density matches vocal density.
-        let (vocal_onset, vocal_offset) = detect_vocal_range(&vocals.samples, vocals.sample_rate);
+        let (vocal_onset, vocal_offset) = detect_vocal_range(samples_ref, vocals.sample_rate);
         let active_dur = (vocal_offset - vocal_onset).max(1.0);
 
         let chunks = make_chunks(
-            &vocals.samples,
+            samples_ref,
             self.config.chunk_seconds,
             self.config.overlap_seconds,
         );

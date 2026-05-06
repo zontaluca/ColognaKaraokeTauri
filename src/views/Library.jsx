@@ -24,58 +24,6 @@ function formatDuration(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-function FeaturedHero({ song, onPlay }) {
-  const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
-  const bg = coverSrc
-    ? `url(${coverSrc}) center/cover no-repeat`
-    : coverGradient(song._dir || song.title || "x");
-
-  return (
-    <div style={{
-      position: "relative", borderRadius: 24, overflow: "hidden",
-      minHeight: 240, padding: 28, background: bg,
-      display: "flex", alignItems: "flex-end",
-      border: "1px solid rgba(255,255,255,0.06)",
-    }}>
-      <div style={{ position: "absolute", inset: 0, background: "linear-gradient(105deg, rgba(7,6,12,0.88) 0%, rgba(7,6,12,0.5) 50%, rgba(7,6,12,0.15) 100%)" }}/>
-      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse at 80% 20%, rgba(255,107,90,0.22), transparent 60%)" }}/>
-
-      <div style={{ position: "relative", zIndex: 1, maxWidth: 520 }}>
-        <div style={{
-          display: "inline-flex", alignItems: "center", gap: 8,
-          padding: "5px 10px", borderRadius: 999,
-          background: "rgba(255,255,255,0.1)", backdropFilter: "blur(12px)",
-          fontSize: 10.5, fontWeight: 700, letterSpacing: 1.4, color: "#FFF", textTransform: "uppercase",
-          marginBottom: 16,
-        }}>
-          <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#F23D6D", boxShadow: "0 0 8px #F23D6D" }}/>
-          Tonight&apos;s pick
-        </div>
-        <h2 style={{
-          margin: 0, fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 48,
-          lineHeight: 0.95, letterSpacing: -2, color: "#FFF",
-          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 500,
-        }}>{song.title || "Unknown"}</h2>
-        <div style={{ marginTop: 10, fontSize: 14, fontWeight: 500, color: "rgba(255,255,255,0.8)" }}>
-          {song.artist || "Unknown"}{song.album ? <span style={{ color: "rgba(255,255,255,0.5)" }}> · {song.album}</span> : null}
-        </div>
-        <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
-          <button onClick={onPlay} style={{
-            all: "unset", cursor: "pointer",
-            display: "inline-flex", alignItems: "center", gap: 8,
-            padding: "10px 18px", borderRadius: 12, fontSize: 13, fontWeight: 600,
-            background: CK_GRADIENT, color: "#FFF",
-            boxShadow: "0 8px 20px rgba(242,61,109,0.35), inset 0 1px 0 rgba(255,255,255,0.2)",
-          }}>
-            <svg width="14" height="14" viewBox="0 0 24 24"><path d="M7 4.5v15L20 12 7 4.5z" fill="currentColor"/></svg>
-            Sing now
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function TrackCard({ song, onPlay, onDelete, onReprocess }) {
   const [hovered, setHovered] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -266,8 +214,6 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
     return list;
   }, [songs, q, filter]);
 
-  const featured = songs[0] || null;
-
   return (
     <div style={{ padding: "28px 36px 36px", overflowY: "auto", height: "100%", boxSizing: "border-box" }}>
       {/* Header */}
@@ -277,7 +223,7 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
             Your library
           </div>
           <h1 style={{ margin: 0, fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 36, letterSpacing: -1.2, lineHeight: 1, color: "#FFF" }}>
-            Featured tonight
+            Songs
           </h1>
           <div style={{ marginTop: 8, fontSize: 13.5, color: "rgba(237,233,255,0.55)", fontWeight: 500 }}>
             {songs.length} tracks · {songs.filter(s => s.lrc).length} with word-sync lyrics
@@ -288,9 +234,6 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
           <PrimaryBtn onClick={onAddSong} icon={<PlusIcon/>}>Add song</PrimaryBtn>
         </div>
       </div>
-
-      {/* Featured hero */}
-      {featured && <FeaturedHero song={featured} onPlay={() => onPlay(featured)}/>}
 
       {/* Search + filters */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", margin: "28px 0 18px" }}>

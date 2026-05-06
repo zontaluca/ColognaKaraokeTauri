@@ -23,6 +23,7 @@ rubato = "0.15"
 regex = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
 
 # Enable Metal GPU on macOS; remove if targeting non-Apple hardware.
 [features]

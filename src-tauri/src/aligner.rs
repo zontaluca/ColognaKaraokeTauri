@@ -671,7 +671,7 @@ async fn try_forced_alignment(
         .unwrap_or("it")
         .to_string();
 
-    let model = if cfg!(feature = "metal") { WhisperModel::Medium } else { WhisperModel::Small };
+    let model = if cfg!(feature = "metal") { WhisperModel::LargeV3Turbo } else { WhisperModel::Small };
     let config = AlignmentConfig { model, language, ..Default::default() };
 
     let aligner = match ForcedAligner::new(config).await {
@@ -769,6 +769,15 @@ pub async fn run_alignment(
     let segments = parse_whisper_segments(&result)?;
     let words = whisper_only_words(&segments)?;
     write_words_json(dir, &words)
+}
+
+#[tauri::command]
+pub fn get_whisper_model() -> String {
+    if cfg!(feature = "metal") {
+        "LargeV3Turbo (Metal GPU)".into()
+    } else {
+        "Small (CPU)".into()
+    }
 }
 
 #[tauri::command]

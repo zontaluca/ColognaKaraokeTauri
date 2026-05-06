@@ -78,10 +78,12 @@ export default function Settings() {
   const [cookiesFile, setCookiesFile] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+  const [whisperModel, setWhisperModel] = useState(null);
 
   useEffect(() => {
     invoke("get_cookie_browser").then(setCookieBrowser).catch(console.error);
     invoke("get_cookies_file").then(setCookiesFile).catch(console.error);
+    invoke("get_whisper_model").then(setWhisperModel).catch(console.error);
   }, []);
 
   async function selectCookieBrowser(val) {
@@ -114,6 +116,27 @@ export default function Settings() {
           Tune the app to your room and your voice.
         </div>
       </div>
+
+      {/* Aligner model */}
+      <SettingGroup title="Alignment model">
+        <SettingRow
+          label="Whisper model"
+          hint="Compile with --features metal to use LargeV3Turbo on Apple Silicon GPU."
+          last
+          control={
+            <span style={{
+              fontSize: 12, fontFamily: "var(--font-mono)",
+              padding: "4px 10px", borderRadius: 7,
+              background: "rgba(255,255,255,0.06)",
+              color: "rgba(237,233,255,0.75)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              flexShrink: 0,
+            }}>
+              {whisperModel ?? "…"}
+            </span>
+          }
+        />
+      </SettingGroup>
 
       {/* YouTube cookies section */}
       <SettingGroup title="YouTube cookies">

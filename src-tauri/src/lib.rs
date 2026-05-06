@@ -60,6 +60,7 @@ pub fn run() {
             pipeline::process_youtube_url,
             pipeline::reprocess_song,
             aligner::get_words,
+            aligner::get_whisper_model,
             aligner::get_cookie_browser,
             aligner::set_cookie_browser,
             aligner::get_cookies_file,
