@@ -61,6 +61,16 @@ pub fn scan_library(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
                     "has_original".to_string(),
                     serde_json::Value::Bool(path.join("original.mp3").exists()),
                 );
+                let words_path = path.join("words.json");
+                let lrc_enhanced = fs::read_to_string(&words_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+                    .unwrap_or(false);
+                obj.insert(
+                    "lrc_enhanced".to_string(),
+                    serde_json::Value::Bool(lrc_enhanced),
+                );
                 let cover = path.join("cover.jpg");
                 if cover.exists() && !obj.contains_key("cover_path") {
                     obj.insert(

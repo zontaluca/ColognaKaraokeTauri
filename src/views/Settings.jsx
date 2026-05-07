@@ -79,12 +79,28 @@ export default function Settings() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   const [whisperModel, setWhisperModel] = useState(null);
+  const [alignmentMode, setAlignmentMode] = useState("forced_per_phrase");
 
   useEffect(() => {
     invoke("get_cookie_browser").then(setCookieBrowser).catch(console.error);
     invoke("get_cookies_file").then(setCookiesFile).catch(console.error);
     invoke("get_whisper_model").then(setWhisperModel).catch(console.error);
+    invoke("get_alignment_mode").then(setAlignmentMode).catch(console.error);
   }, []);
+
+  const gpuDisabled = whisperModel === "disabled";
+
+  async function selectAlignmentMode(val) {
+    setSaving(true); setError(null);
+    try { await invoke("set_alignment_mode", { mode: val }); setAlignmentMode(val); }
+    catch (e) { setError(String(e)); } finally { setSaving(false); }
+  }
+
+  async function selectWhisperModel(val) {
+    setSaving(true); setError(null);
+    try { await invoke("set_whisper_model", { model: val }); setWhisperModel(val); }
+    catch (e) { setError(String(e)); } finally { setSaving(false); }
+  }
 
   async function selectCookieBrowser(val) {
     setSaving(true); setError(null);
@@ -117,25 +133,74 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* Aligner model */}
-      <SettingGroup title="Alignment model">
-        <SettingRow
-          label="Whisper model"
-          hint="Compile with --features metal to use LargeV3Turbo on Apple Silicon GPU."
-          last
-          control={
-            <span style={{
-              fontSize: 12, fontFamily: "var(--font-mono)",
-              padding: "4px 10px", borderRadius: 7,
-              background: "rgba(255,255,255,0.06)",
-              color: "rgba(237,233,255,0.75)",
-              border: "1px solid rgba(255,255,255,0.08)",
-              flexShrink: 0,
-            }}>
-              {whisperModel ?? "…"}
-            </span>
-          }
-        />
+      {/* Word alignment */}
+      <SettingGroup title="Word alignment">
+        {gpuDisabled ? (
+          <SettingRow
+            label="Whisper model"
+            hint="GPU non disponibile — allineamento word-level disattivato. Player usa timing per linea."
+            last
+            control={
+              <span style={{
+                fontSize: 12, fontFamily: "var(--font-mono)",
+                padding: "4px 10px", borderRadius: 7,
+                background: "rgba(255,255,255,0.06)",
+                color: "rgba(237,233,255,0.75)",
+                border: "1px solid rgba(255,255,255,0.08)",
+                flexShrink: 0,
+              }}>Disabled</span>
+            }
+          />
+        ) : (
+          <>
+            <div style={{ padding: "10px 18px 4px", fontSize: 11, fontWeight: 700, letterSpacing: 1.2, color: "rgba(237,233,255,0.4)", textTransform: "uppercase" }}>
+              Modello Whisper
+            </div>
+            {[
+              {
+                val: "large_v3_turbo",
+                label: "Large V3 Turbo",
+                desc: "Più accurato. Più lento sui brani lunghi. Default raccomandato.",
+              },
+              {
+                val: "medium",
+                label: "Medium",
+                desc: "Più veloce. Accuratezza inferiore su brani con allucinazioni o lyrics non standard.",
+              },
+            ].map(({ val, label, desc }, i, arr) => (
+              <RadioCard
+                key={val} label={label} desc={desc}
+                checked={whisperModel === val}
+                disabled={saving}
+                onChange={() => selectWhisperModel(val)}
+                last={i === arr.length - 1}
+              />
+            ))}
+            <div style={{ padding: "10px 18px 4px", fontSize: 11, fontWeight: 700, letterSpacing: 1.2, color: "rgba(237,233,255,0.4)", textTransform: "uppercase" }}>
+              Algoritmo di allineamento
+            </div>
+            {[
+              {
+                val: "forced_per_phrase",
+                label: "Forced alignment",
+                desc: "Whisper allinea il testo LRC noto all'audio per frase. Veloce, richiede LRC corrispondente al cantato.",
+              },
+              {
+                val: "free_transcribe_per_phrase",
+                label: "Free transcribe + match",
+                desc: "Whisper trascrive ogni frase liberamente, fuzzy-match con LRC. Più lento ma tollera mismatch e allucinazioni.",
+              },
+            ].map(({ val, label, desc }, i, arr) => (
+              <RadioCard
+                key={val} label={label} desc={desc}
+                checked={alignmentMode === val}
+                disabled={saving}
+                onChange={() => selectAlignmentMode(val)}
+                last={i === arr.length - 1}
+              />
+            ))}
+          </>
+        )}
       </SettingGroup>
 
       {/* YouTube cookies section */}

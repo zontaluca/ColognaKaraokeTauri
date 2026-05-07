@@ -396,6 +396,7 @@ pub struct ForcedAlignDecoder {
     token_embedding: Embedding,
     positional_embedding: Tensor,
     layers: Vec<DecoderLayer>,
+    ln_post: LayerNorm,
     n_layer: usize,
 }
 
@@ -412,6 +413,7 @@ impl ForcedAlignDecoder {
                 "embed_positions.weight",
             )?,
             layers,
+            ln_post: layer_norm(cfg.d_model, 1e-5, vb.pp("layer_norm"))?,
             n_layer,
         })
     }
@@ -467,5 +469,50 @@ impl ForcedAlignDecoder {
         // Convert to Vec<Vec<f32>>.
         let flat = avg.to_vec2::<f32>()?;
         Ok(flat)
+    }
+
+    /// Greedy autoregressive decode. Returns only newly generated tokens
+    /// (not the prefix). Stops on EOT or after `max_new_tokens`.
+    pub fn greedy_decode(
+        &self,
+        encoder_out: &Tensor,
+        prefix: &[u32],
+        eot: u32,
+        max_new_tokens: usize,
+        device: &Device,
+    ) -> candle_core::Result<Vec<u32>> {
+        let mut tokens: Vec<u32> = prefix.to_vec();
+        let embed_w = self.token_embedding.embeddings();
+
+        for _ in 0..max_new_tokens {
+            let n = tokens.len();
+            let tok_t = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
+            let emb = self.token_embedding.forward(&tok_t)?;
+            let pos = self.positional_embedding.i(..n)?.unsqueeze(0)?;
+            let mut x = emb.broadcast_add(&pos)?;
+
+            let causal: Vec<f32> = (0..n)
+                .flat_map(|i| (0..n).map(move |j| if j <= i { 0.0f32 } else { f32::NEG_INFINITY }))
+                .collect();
+            let causal_mask = Tensor::from_vec(causal, (1, 1, n, n), device)?.to_dtype(DType::F32)?;
+
+            for layer in &self.layers {
+                let (x_new, _) = layer.forward(&x, encoder_out, &causal_mask)?;
+                x = x_new;
+            }
+
+            // Apply final layer norm before logit projection (tied embeddings).
+            let x = self.ln_post.forward(&x)?; // [1, n, d]
+            let last = x.i((0, n - 1))?; // [d]
+            // Logits = embed_weight @ last  → [vocab]
+            let logits = embed_w.matmul(&last.unsqueeze(1)?)?.squeeze(1)?;
+            let next_id = logits.argmax(0)?.to_scalar::<u32>()?;
+            if next_id == eot {
+                break;
+            }
+            tokens.push(next_id);
+        }
+
+        Ok(tokens[prefix.len()..].to_vec())
     }
 }

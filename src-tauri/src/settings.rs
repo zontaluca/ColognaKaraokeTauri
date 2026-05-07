@@ -39,6 +39,66 @@ impl CookieBrowser {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignmentMode {
+    ForcedPerPhrase,
+    FreeTranscribePerPhrase,
+}
+
+impl Default for AlignmentMode {
+    fn default() -> Self {
+        Self::ForcedPerPhrase
+    }
+}
+
+impl AlignmentMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ForcedPerPhrase => "forced_per_phrase",
+            Self::FreeTranscribePerPhrase => "free_transcribe_per_phrase",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "forced_per_phrase" => Some(Self::ForcedPerPhrase),
+            "free_transcribe_per_phrase" => Some(Self::FreeTranscribePerPhrase),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WhisperModelChoice {
+    Medium,
+    LargeV3Turbo,
+}
+
+impl Default for WhisperModelChoice {
+    fn default() -> Self {
+        Self::LargeV3Turbo
+    }
+}
+
+impl WhisperModelChoice {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Medium => "medium",
+            Self::LargeV3Turbo => "large_v3_turbo",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "medium" => Some(Self::Medium),
+            "large_v3_turbo" => Some(Self::LargeV3Turbo),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppSettings {
     #[serde(default)]
@@ -46,6 +106,10 @@ pub struct AppSettings {
     /// Path to a Netscape-format cookies.txt file (overrides cookie_browser when set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookies_file: Option<String>,
+    #[serde(default)]
+    pub alignment_mode: AlignmentMode,
+    #[serde(default)]
+    pub whisper_model: WhisperModelChoice,
 }
 
 fn settings_path(app: &AppHandle) -> PathBuf {

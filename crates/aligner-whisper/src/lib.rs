@@ -481,6 +481,78 @@ impl ForcedAligner {
         Ok(out)
     }
 
+    /// Free-transcription with word-level timing for a single audio segment.
+    ///
+    /// Greedy-decodes the audio (no forced lyrics) to obtain the spoken text,
+    /// then runs the standard forced-aligner on the decoded text to recover
+    /// per-word timestamps. Useful when LRC text doesn't match what's actually
+    /// sung (filler, ad-libs, repeats).
+    ///
+    /// Returns `Vec<AlignedWord>` with `word` set to the decoded text.
+    /// Empty result if greedy decode produces nothing usable.
+    pub fn transcribe_segment(
+        &self,
+        audio: &AudioBuffer,
+    ) -> Result<Vec<AlignedWord>, AlignError> {
+        if audio.sample_rate != 16_000 {
+            return Err(AlignError::BadSampleRate(audio.sample_rate));
+        }
+        if audio.samples.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Mel + encoder
+        let mel = log_mel_spectrogram(&audio.samples, n_mels_for(&self.config.model));
+        let encoder_out = self
+            .encode_mel(&mel)
+            .map_err(|e| AlignError::Inference(e.to_string()))?;
+
+        let special = SpecialTokens::for_language(
+            &self.resources.tokenizer,
+            &self.config.language,
+        )?;
+        let prefix = [
+            special.sot,
+            special.lang_id,
+            special.transcribe,
+            special.no_timestamps,
+        ];
+
+        let new_tokens = self
+            .resources
+            .decoder
+            .greedy_decode(
+                &encoder_out,
+                &prefix,
+                special.eot,
+                448,
+                &self.resources.device,
+            )
+            .map_err(|e| AlignError::Inference(e.to_string()))?;
+
+        if new_tokens.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Decode full token list to text. Whisper tokenizer has built-in
+        // word-boundary handling via leading-space markers.
+        let text = self
+            .resources
+            .tokenizer
+            .decode(&new_tokens, true)
+            .map_err(|e| AlignError::Tokenization(e.to_string()))?
+            .trim()
+            .to_string();
+
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Reuse `align()` to get word-level timing on the decoded text.
+        // Encoder will run again — acceptable cost for code simplicity.
+        self.align(audio, &text)
+    }
+
     // ─── Private helpers ─────────────────────────────────────────────────────
 
     fn tokenize_single(&self, word: &str, first: bool) -> Result<Vec<u32>, AlignError> {

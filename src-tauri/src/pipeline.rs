@@ -139,7 +139,20 @@ where
     // Step 4 — align words (mandatory)
     on_progress(4, "active", "Aligning words...", 0.78);
     let lrc_for_align = lrc.clone();
-    let words_result = run_alignment(&app, &final_song_dir, lrc_for_align.as_deref()).await;
+    let phrase_cb = std::sync::Mutex::new(on_progress.clone());
+    let on_phrase = move |done: usize, total: usize| {
+        if total == 0 {
+            return;
+        }
+        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+        let progress = 0.78 + frac * 0.10;
+        let msg = format!("Aligning {}/{}", done, total);
+        if let Ok(mut cb) = phrase_cb.lock() {
+            cb(4, "active", &msg, progress);
+        }
+    };
+    let words_result =
+        run_alignment(&app, &final_song_dir, lrc_for_align.as_deref(), &on_phrase).await;
     match &words_result {
         Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
         Err(e) => {
@@ -247,7 +260,19 @@ where
     let _ = std::fs::remove_file(dir.join("words.json"));
     on_progress(4, "active", "Aligning words...", 0.76);
     let lrc_for_align = lrc.clone();
-    let words_result = run_alignment(&app, &dir, lrc_for_align.as_deref()).await;
+    let phrase_cb = std::sync::Mutex::new(on_progress.clone());
+    let on_phrase = move |done: usize, total: usize| {
+        if total == 0 {
+            return;
+        }
+        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+        let progress = 0.76 + frac * 0.12;
+        let msg = format!("Aligning {}/{}", done, total);
+        if let Ok(mut cb) = phrase_cb.lock() {
+            cb(4, "active", &msg, progress);
+        }
+    };
+    let words_result = run_alignment(&app, &dir, lrc_for_align.as_deref(), &on_phrase).await;
     match &words_result {
         Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
         Err(e) => { on_progress(4, "error", e, 0.0); return Err(e.clone()); }

@@ -105,9 +105,13 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
             <span style={{
               display: "inline-flex", padding: "3px 8px", borderRadius: 999,
               fontSize: 9.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase",
-              background: CK_GRADIENT, color: "#FFF",
-              boxShadow: "0 4px 10px rgba(242,61,109,0.3)",
-            }}>LRC</span>
+              background: song.lrc_enhanced ? CK_GRADIENT : "rgba(0,0,0,0.55)",
+              color: "#FFF",
+              boxShadow: song.lrc_enhanced
+                ? "0 4px 10px rgba(242,61,109,0.3)"
+                : "0 2px 6px rgba(0,0,0,0.3)",
+              border: song.lrc_enhanced ? "none" : "1px solid rgba(255,255,255,0.18)",
+            }}>{song.lrc_enhanced ? "LRC Enhanced" : "LRC"}</span>
           )}
         </div>
       </div>
@@ -226,7 +230,7 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
             Songs
           </h1>
           <div style={{ marginTop: 8, fontSize: 13.5, color: "rgba(237,233,255,0.55)", fontWeight: 500 }}>
-            {songs.length} tracks · {songs.filter(s => s.lrc).length} with word-sync lyrics
+            {songs.length} tracks · {songs.filter(s => s.lrc_enhanced).length} word-synced · {songs.filter(s => s.lrc && !s.lrc_enhanced).length} line-synced
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
