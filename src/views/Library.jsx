@@ -24,6 +24,23 @@ function formatDuration(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
+function LrcBadge({ song }) {
+  if (!song.lrc) return null;
+  return (
+    <span style={{
+      display: "inline-flex", padding: "3px 8px", borderRadius: 999,
+      fontSize: 9.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase",
+      background: song.lrc_enhanced ? CK_GRADIENT : "rgba(0,0,0,0.55)",
+      color: "#FFF",
+      boxShadow: song.lrc_enhanced ? "0 4px 10px rgba(242,61,109,0.3)" : "0 2px 6px rgba(0,0,0,0.3)",
+      border: song.lrc_enhanced ? "none" : "1px solid rgba(255,255,255,0.18)",
+      flexShrink: 0,
+    }}>
+      {song.lrc_enhanced ? "LRC Enhanced" : "LRC"}
+    </span>
+  );
+}
+
 function TrackCard({ song, onPlay, onDelete, onReprocess }) {
   const [hovered, setHovered] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -80,14 +97,12 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
         boxShadow: hovered ? "0 16px 32px rgba(0,0,0,0.4)" : "none",
       }}
     >
-      {/* Cover */}
       <div style={{ position: "relative", aspectRatio: "1", background: bg }}>
         <div style={{
           position: "absolute", inset: 0,
           background: "linear-gradient(180deg, transparent 40%, rgba(0,0,0,0.6) 100%)",
           opacity: hovered ? 1 : 0.7, transition: "opacity 180ms",
         }}/>
-        {/* Play button */}
         <div style={{
           position: "absolute", bottom: 10, right: 10,
           width: 40, height: 40, borderRadius: "50%",
@@ -99,23 +114,10 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
         }}>
           <svg width="14" height="14" viewBox="0 0 24 24"><path d="M7 4.5v15L20 12 7 4.5z" fill="#FFF"/></svg>
         </div>
-        {/* Badges */}
-        <div style={{ position: "absolute", top: 10, left: 10, display: "flex", gap: 5 }}>
-          {song.lrc && (
-            <span style={{
-              display: "inline-flex", padding: "3px 8px", borderRadius: 999,
-              fontSize: 9.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase",
-              background: song.lrc_enhanced ? CK_GRADIENT : "rgba(0,0,0,0.55)",
-              color: "#FFF",
-              boxShadow: song.lrc_enhanced
-                ? "0 4px 10px rgba(242,61,109,0.3)"
-                : "0 2px 6px rgba(0,0,0,0.3)",
-              border: song.lrc_enhanced ? "none" : "1px solid rgba(255,255,255,0.18)",
-            }}>{song.lrc_enhanced ? "LRC Enhanced" : "LRC"}</span>
-          )}
+        <div style={{ position: "absolute", top: 10, left: 10 }}>
+          <LrcBadge song={song}/>
         </div>
       </div>
-      {/* Info */}
       <div style={{ padding: 14 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
           <div style={{ fontSize: 14, fontWeight: 700, color: "#FFF", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
@@ -128,7 +130,6 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
         <div style={{ marginTop: 4, fontSize: 12, color: "rgba(237,233,255,0.55)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {song.artist || "Unknown"}
         </div>
-        {/* Actions */}
         <div style={{ display: "flex", gap: 6, marginTop: 10, alignItems: "center" }}>
           <button
             onClick={handleDelete}
@@ -169,6 +170,136 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
   );
 }
 
+function TrackRow({ song, onPlay, onDelete, onReprocess }) {
+  const [hovered, setHovered] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [reprocessing, setReprocessing] = useState(false);
+  const [reprocessMsg, setReprocessMsg] = useState("");
+  const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
+  const bg = coverSrc ? `url(${coverSrc}) center/cover no-repeat` : coverGradient(song._dir || "x");
+
+  const handleDelete = async (e) => {
+    e.stopPropagation();
+    if (!confirming) { setConfirming(true); return; }
+    try {
+      await invoke("delete_song", { dir: song._dir });
+      onDelete(song._dir);
+    } catch (err) {
+      console.error("delete_song failed", err);
+    }
+  };
+
+  const handleReprocess = async (e) => {
+    e.stopPropagation();
+    if (reprocessing) return;
+    setReprocessing(true);
+    setReprocessMsg("Starting…");
+    let unlisten;
+    try {
+      unlisten = await listen("karaoke://reprocess-progress", (ev) => {
+        const { message, status } = ev.payload || {};
+        if (status === "error") setReprocessMsg("Error: " + message);
+        else setReprocessMsg(message || "");
+      });
+      await invoke("reprocess_song", { dir: song._dir });
+      setReprocessMsg("Done!");
+      await onReprocess?.(song._dir);
+    } catch (err) {
+      setReprocessMsg("Error: " + err);
+    } finally {
+      unlisten?.();
+      setTimeout(() => { setReprocessing(false); setReprocessMsg(""); }, 1500);
+    }
+  };
+
+  return (
+    <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => { setHovered(false); setConfirming(false); }}
+      onClick={() => onPlay(song)}
+      style={{
+        display: "flex", alignItems: "center", gap: 12,
+        padding: "8px 12px", borderRadius: 10, cursor: "pointer",
+        background: hovered ? "rgba(255,255,255,0.05)" : "transparent",
+        transition: "background 140ms",
+      }}
+    >
+      {/* Thumbnail */}
+      <div style={{
+        width: 44, height: 44, borderRadius: 8, flexShrink: 0,
+        background: bg,
+        position: "relative", overflow: "hidden",
+      }}>
+        {hovered && (
+          <div style={{
+            position: "absolute", inset: 0,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}>
+            <svg width="12" height="12" viewBox="0 0 24 24"><path d="M7 4.5v15L20 12 7 4.5z" fill="#FFF"/></svg>
+          </div>
+        )}
+      </div>
+
+      {/* Title + artist */}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 600, color: "#FFF", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {song.title || "Unknown"}
+        </div>
+        <div style={{ fontSize: 11.5, color: "rgba(237,233,255,0.5)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>
+          {song.artist || "Unknown"}
+        </div>
+      </div>
+
+      {/* Badge */}
+      <LrcBadge song={song}/>
+
+      {/* Duration */}
+      <span style={{ fontSize: 11, color: "rgba(237,233,255,0.4)", fontFamily: "var(--font-mono)", flexShrink: 0, width: 36, textAlign: "right" }}>
+        {formatDuration(song.duration_sec)}
+      </span>
+
+      {/* Actions (visible on hover) */}
+      <div style={{
+        display: "flex", gap: 4, flexShrink: 0,
+        opacity: hovered ? 1 : 0, transition: "opacity 140ms",
+      }} onClick={e => e.stopPropagation()}>
+        {reprocessing ? (
+          <span style={{ fontSize: 10, color: "rgba(237,233,255,0.5)", maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {reprocessMsg}
+          </span>
+        ) : (
+          <button
+            onClick={handleReprocess}
+            title="Re-process"
+            style={{
+              all: "unset", cursor: "pointer",
+              fontSize: 10.5, padding: "3px 8px", borderRadius: 5,
+              background: "rgba(255,255,255,0.04)",
+              color: "rgba(237,233,255,0.45)",
+              border: "1px solid rgba(255,255,255,0.06)",
+            }}
+          >↻</button>
+        )}
+        <button
+          onClick={handleDelete}
+          onBlur={() => setConfirming(false)}
+          style={{
+            all: "unset", cursor: "pointer",
+            fontSize: 10.5, padding: "3px 8px", borderRadius: 5,
+            background: confirming ? "rgba(242,61,109,0.2)" : "rgba(255,255,255,0.04)",
+            color: confirming ? "#F23D6D" : "rgba(237,233,255,0.45)",
+            border: confirming ? "1px solid rgba(242,61,109,0.3)" : "1px solid rgba(255,255,255,0.06)",
+            transition: "all 140ms",
+          }}
+        >
+          {confirming ? "?" : "✕"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function AddTrackCard({ onAdd }) {
   const [hovered, setHovered] = useState(false);
   return (
@@ -200,23 +331,72 @@ function AddTrackCard({ onAdd }) {
   );
 }
 
+function AddTrackRow({ onAdd }) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onClick={onAdd}
+      style={{
+        display: "flex", alignItems: "center", gap: 12,
+        padding: "8px 12px", borderRadius: 10, cursor: "pointer",
+        background: hovered ? "rgba(255,107,90,0.08)" : "transparent",
+        transition: "background 140ms",
+      }}
+    >
+      <div style={{
+        width: 44, height: 44, borderRadius: 8, flexShrink: 0,
+        border: "1.5px dashed rgba(255,107,90,0.4)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        color: "#FF9070", fontSize: 20,
+      }}>+</div>
+      <div style={{ fontSize: 13, fontWeight: 600, color: "#FF9070" }}>Add from YouTube</div>
+    </div>
+  );
+}
+
 const FILTERS = [
-  { id: "all",    label: "All" },
-  { id: "lrc",    label: "Synced lyrics" },
-  { id: "recent", label: "Recently added" },
+  { id: "all",          label: "All" },
+  { id: "lrc_enhanced", label: "LRC Enhanced" },
+  { id: "lrc",          label: "LRC" },
 ];
+
+function letterKey(title) {
+  const first = (title || "").trimStart()[0] || "";
+  const upper = first.toUpperCase();
+  return /[A-Z]/.test(upper) ? upper : "#";
+}
 
 export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong, onReprocess }) {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("all");
+  const [viewMode, setViewMode] = useState("grid");
 
   const filtered = useMemo(() => {
     let list = songs;
     const needle = q.trim().toLowerCase();
     if (needle) list = list.filter(s => (s.title || "").toLowerCase().includes(needle) || (s.artist || "").toLowerCase().includes(needle));
-    if (filter === "lrc") list = list.filter(s => Boolean(s.lrc));
+    if (filter === "lrc_enhanced") list = list.filter(s => s.lrc_enhanced);
+    else if (filter === "lrc") list = list.filter(s => s.lrc && !s.lrc_enhanced);
     return list;
   }, [songs, q, filter]);
+
+  const groups = useMemo(() => {
+    const sorted = [...filtered].sort((a, b) =>
+      (a.title || "").localeCompare(b.title || "", "it", { sensitivity: "base" })
+    );
+    const map = {};
+    for (const s of sorted) {
+      const key = letterKey(s.title);
+      (map[key] = map[key] || []).push(s);
+    }
+    return Object.entries(map).sort(([a], [b]) => {
+      if (a === "#") return 1;
+      if (b === "#") return -1;
+      return a.localeCompare(b);
+    });
+  }, [filtered]);
 
   return (
     <div style={{ padding: "28px 36px 36px", overflowY: "auto", height: "100%", boxSizing: "border-box" }}>
@@ -239,15 +419,16 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
         </div>
       </div>
 
-      {/* Search + filters */}
-      <div style={{ display: "flex", gap: 12, alignItems: "center", margin: "28px 0 18px" }}>
+      {/* Search + filters + view toggle */}
+      <div style={{ display: "flex", gap: 10, alignItems: "center", margin: "28px 0 18px", flexWrap: "wrap" }}>
+        {/* Search */}
         <div style={{
-          flex: 1, display: "flex", alignItems: "center", gap: 10,
-          padding: "12px 16px", borderRadius: 12,
+          flex: 1, minWidth: 180, display: "flex", alignItems: "center", gap: 10,
+          padding: "10px 14px", borderRadius: 12,
           background: "rgba(255,255,255,0.03)",
           border: "1px solid rgba(255,255,255,0.06)",
         }}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
             <circle cx="11" cy="11" r="7" stroke="rgba(237,233,255,0.5)" strokeWidth="1.8"/>
             <path d="M16 16l5 5" stroke="rgba(237,233,255,0.5)" strokeWidth="1.8" strokeLinecap="round"/>
           </svg>
@@ -259,40 +440,106 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
               color: "#FFF", fontSize: 13.5, fontFamily: "var(--font-sans)", fontWeight: 500,
             }}
           />
-          <kbd style={{
-            fontSize: 10, padding: "3px 7px", borderRadius: 5,
-            background: "rgba(255,255,255,0.06)", color: "rgba(237,233,255,0.5)",
-            fontFamily: "var(--font-mono)", letterSpacing: 0.5,
-          }}>⌘ K</kbd>
         </div>
+
+        {/* LRC filter pills */}
         <div style={{ display: "flex", gap: 4, padding: 4, borderRadius: 10, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
           {FILTERS.map(f => (
             <button key={f.id} onClick={() => setFilter(f.id)} style={{
               all: "unset", cursor: "pointer",
-              padding: "7px 14px", borderRadius: 7,
+              padding: "6px 12px", borderRadius: 7,
               fontSize: 12, fontWeight: 600,
               color: filter === f.id ? "#FFF" : "rgba(237,233,255,0.55)",
-              background: filter === f.id ? "rgba(255,255,255,0.08)" : "transparent",
+              background: filter === f.id
+                ? (f.id === "lrc_enhanced" ? CK_GRADIENT : "rgba(255,255,255,0.08)")
+                : "transparent",
               transition: "all 140ms",
             }}>{f.label}</button>
           ))}
         </div>
+
+        {/* View mode toggle */}
+        <div style={{ display: "flex", gap: 2, padding: 4, borderRadius: 10, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+          <button
+            onClick={() => setViewMode("grid")}
+            title="Grid view"
+            style={{
+              all: "unset", cursor: "pointer",
+              padding: "6px 10px", borderRadius: 7,
+              color: viewMode === "grid" ? "#FFF" : "rgba(237,233,255,0.45)",
+              background: viewMode === "grid" ? "rgba(255,255,255,0.08)" : "transparent",
+              transition: "all 140ms", display: "flex", alignItems: "center",
+            }}
+          >
+            <GridIcon/>
+          </button>
+          <button
+            onClick={() => setViewMode("list")}
+            title="List view"
+            style={{
+              all: "unset", cursor: "pointer",
+              padding: "6px 10px", borderRadius: 7,
+              color: viewMode === "list" ? "#FFF" : "rgba(237,233,255,0.45)",
+              background: viewMode === "list" ? "rgba(255,255,255,0.08)" : "transparent",
+              transition: "all 140ms", display: "flex", alignItems: "center",
+            }}
+          >
+            <ListIcon/>
+          </button>
+        </div>
       </div>
 
-      {/* Grid */}
+      {/* Content */}
       {filtered.length === 0 ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 48, color: "rgba(237,233,255,0.4)", textAlign: "center", gap: 12 }}>
           <div style={{ fontSize: 48, opacity: 0.5 }}>🎶</div>
           <div style={{ fontSize: 14 }}>No songs yet. Head to Download to add some.</div>
         </div>
-      ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 18 }}>
-          {filtered.map(s => (
-            <TrackCard key={s._dir} song={s} onPlay={onPlay} onDelete={onDelete} onReprocess={onReprocess}/>
+      ) : viewMode === "grid" ? (
+        <div>
+          {groups.map(([letter, groupSongs]) => (
+            <div key={letter} style={{ marginBottom: 28 }}>
+              <LetterHeader letter={letter}/>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 16 }}>
+                {groupSongs.map(s => (
+                  <TrackCard key={s._dir} song={s} onPlay={onPlay} onDelete={onDelete} onReprocess={onReprocess}/>
+                ))}
+              </div>
+            </div>
           ))}
-          <AddTrackCard onAdd={onAddSong}/>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 16, marginTop: groups.length > 0 ? 0 : 0 }}>
+            <AddTrackCard onAdd={onAddSong}/>
+          </div>
+        </div>
+      ) : (
+        <div>
+          {groups.map(([letter, groupSongs]) => (
+            <div key={letter} style={{ marginBottom: 20 }}>
+              <LetterHeader letter={letter}/>
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                {groupSongs.map(s => (
+                  <TrackRow key={s._dir} song={s} onPlay={onPlay} onDelete={onDelete} onReprocess={onReprocess}/>
+                ))}
+              </div>
+            </div>
+          ))}
+          <AddTrackRow onAdd={onAddSong}/>
         </div>
       )}
+    </div>
+  );
+}
+
+function LetterHeader({ letter }) {
+  return (
+    <div style={{
+      fontSize: 11, fontWeight: 700, letterSpacing: 1.5,
+      color: "#FF9070", textTransform: "uppercase",
+      padding: "4px 0 10px",
+      borderBottom: "1px solid rgba(255,255,255,0.05)",
+      marginBottom: 12,
+    }}>
+      {letter}
     </div>
   );
 }
@@ -331,5 +578,20 @@ function RefreshIcon() {
 function PlusIcon() {
   return <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
     <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"/>
+  </svg>;
+}
+function GridIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+    <rect x="3" y="3" width="7" height="7" rx="1.5" fill="currentColor"/>
+    <rect x="14" y="3" width="7" height="7" rx="1.5" fill="currentColor"/>
+    <rect x="3" y="14" width="7" height="7" rx="1.5" fill="currentColor"/>
+    <rect x="14" y="14" width="7" height="7" rx="1.5" fill="currentColor"/>
+  </svg>;
+}
+function ListIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+    <rect x="3" y="4" width="18" height="2.5" rx="1.25" fill="currentColor"/>
+    <rect x="3" y="10.75" width="18" height="2.5" rx="1.25" fill="currentColor"/>
+    <rect x="3" y="17.5" width="18" height="2.5" rx="1.25" fill="currentColor"/>
   </svg>;
 }

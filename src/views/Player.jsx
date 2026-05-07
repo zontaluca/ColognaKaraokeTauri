@@ -96,7 +96,7 @@ function Avatar({ name }) {
   );
 }
 
-export default function Player({ song }) {
+export default function Player({ song, onPlayingChange }) {
   const audioRef = useRef(null);
   const waveformRef = useRef(null);
   const rafRef = useRef(0);
@@ -249,6 +249,8 @@ export default function Player({ song }) {
     if (playing) { rafRef.current = requestAnimationFrame(tick); return () => cancelAnimationFrame(rafRef.current); }
     cancelAnimationFrame(rafRef.current);
   }, [playing, tick]);
+
+  useEffect(() => { onPlayingChange?.(playing); }, [playing, onPlayingChange]);
 
   useEffect(() => {
     const a = audioRef.current;

@@ -14,6 +14,7 @@ export default function App() {
   const [view, setView] = useState("library");
   const [songs, setSongs] = useState([]);
   const [currentSong, setCurrentSong] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
 
   const refreshLibrary = useCallback(async () => {
     try {
@@ -30,6 +31,7 @@ export default function App() {
 
   const playSong = (song) => {
     setCurrentSong(song);
+    setIsPlaying(false);
     setView("player");
   };
 
@@ -57,11 +59,11 @@ export default function App() {
     <JobsProvider onJobDone={onJobDone}>
       <Background view={view} />
       <div className="app">
-        <Sidebar view={view} onView={setView} />
+        <Sidebar view={view} onView={setView} currentSong={currentSong} isPlaying={isPlaying} />
         <main className="main">
           {view === "library" && <Library songs={songs} onPlay={playSong} onDelete={deleteSong} onRefresh={refreshLibrary} onAddSong={() => setView("download")} onReprocess={refreshCurrentSong}/>}
           {view === "download" && <Download />}
-          {view === "player" && <Player song={currentSong} />}
+          {view === "player" && <Player song={currentSong} onPlayingChange={setIsPlaying} />}
           {view === "leaderboard" && <Leaderboard songs={songs} />}
           {view === "settings" && <Settings />}
         </main>

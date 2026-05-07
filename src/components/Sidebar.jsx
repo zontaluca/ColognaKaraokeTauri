@@ -1,4 +1,20 @@
+import { convertFileSrc } from "@tauri-apps/api/core";
+
 const CK_GRADIENT = "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)";
+
+const COVER_GRADIENTS = [
+  "linear-gradient(135deg, #FF9A76, #FF4F76)",
+  "linear-gradient(135deg, #9E7AFF, #5E3BF5)",
+  "linear-gradient(135deg, #FFD166, #F9A826)",
+  "linear-gradient(135deg, #22D3A4, #0891B2)",
+  "linear-gradient(135deg, #FB7185, #E11D48)",
+  "linear-gradient(135deg, #A78BFA, #7C3AED)",
+];
+function coverGradient(seed) {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return COVER_GRADIENTS[h % COVER_GRADIENTS.length];
+}
 
 function BrandMark() {
   return (
@@ -73,7 +89,7 @@ const ITEMS = [
   { id: "settings",    label: "Settings"   },
 ];
 
-export default function Sidebar({ view, onView }) {
+export default function Sidebar({ view, onView, currentSong, isPlaying }) {
   return (
     <aside style={{
       width: 240, height: "100vh", flexShrink: 0,
@@ -136,28 +152,43 @@ export default function Sidebar({ view, onView }) {
 
       {/* Mini now-playing */}
       <button onClick={() => onView("player")} style={{
-        all: "unset", cursor: "pointer",
+        all: "unset", cursor: currentSong ? "pointer" : "default",
         padding: 10, borderRadius: 14,
         background: "rgba(255,255,255,0.03)",
-        border: "1px solid rgba(255,255,255,0.06)",
+        border: `1px solid ${currentSong ? "rgba(255,107,90,0.2)" : "rgba(255,255,255,0.06)"}`,
         display: "flex", alignItems: "center", gap: 10,
+        opacity: currentSong ? 1 : 0.45,
+        transition: "all 180ms",
       }}>
         <div style={{
           width: 40, height: 40, borderRadius: 10, flexShrink: 0,
-          background: "linear-gradient(135deg, #FF9A76 0%, #FF4F76 60%, #A240FF 100%)",
+          background: currentSong
+            ? (currentSong.cover_path
+                ? `url(${convertFileSrc(currentSong.cover_path)}) center/cover no-repeat`
+                : coverGradient(currentSong._dir || "x"))
+            : "linear-gradient(135deg, #FF9A76 0%, #FF4F76 60%, #A240FF 100%)",
           display: "flex", alignItems: "center", justifyContent: "center",
           boxShadow: "0 4px 12px rgba(242,61,109,0.4)",
+          position: "relative", overflow: "hidden",
         }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 2, height: 18 }}>
-            {[0, 110, 220, 330].map((delay, i) => <WaveBar key={i} delay={delay}/>)}
-          </div>
+          {isPlaying && (
+            <div style={{
+              position: "absolute", inset: 0,
+              background: "rgba(0,0,0,0.3)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 2, height: 18 }}>
+                {[0, 110, 220, 330].map((delay, i) => <WaveBar key={i} delay={delay}/>)}
+              </div>
+            </div>
+          )}
         </div>
         <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: "#FFF", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            Now Playing
+            {currentSong ? currentSong.title || "Unknown" : "Now Playing"}
           </div>
           <div style={{ fontSize: 10.5, color: "rgba(237,233,255,0.5)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            Tap to open player
+            {currentSong ? currentSong.artist || "Unknown artist" : "No song selected"}
           </div>
         </div>
       </button>
