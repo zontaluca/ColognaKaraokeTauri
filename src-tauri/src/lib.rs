@@ -40,9 +40,15 @@ async fn open_presentation_window(app: AppHandle) -> Result<(), String> {
     .min_inner_size(640.0, 360.0)
     .resizable(true)
     .decorations(true)
+    .fullscreen(false)
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+async fn is_presentation_open(app: AppHandle) -> bool {
+    app.get_webview_window("presentation").is_some()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -80,6 +86,7 @@ pub fn run() {
             leaderboard::leaderboard_global_top,
             open_presentation_window,
             close_presentation_window,
+            is_presentation_open,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

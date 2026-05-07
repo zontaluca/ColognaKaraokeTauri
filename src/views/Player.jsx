@@ -103,7 +103,6 @@ export default function Player({ song }) {
   const activeLineRef = useRef(null);
   const lastSeekRef = useRef(0);
   const stageRef = useRef(null);
-  const [isLyricFullscreen, setIsLyricFullscreen] = useState(false);
   const [presentOpen, setPresentOpen] = useState(false);
 
   const [src, setSrc] = useState(null);
@@ -287,36 +286,6 @@ export default function Player({ song }) {
     return () => unlisten && unlisten();
   }, [challenge]);
 
-  // Fullscreen state tracking (native Fullscreen API on the lyric stage)
-  useEffect(() => {
-    const onFs = () => setIsLyricFullscreen(document.fullscreenElement === stageRef.current);
-    document.addEventListener("fullscreenchange", onFs);
-    return () => document.removeEventListener("fullscreenchange", onFs);
-  }, []);
-
-  const toggleLyricFullscreen = useCallback(() => {
-    const el = stageRef.current;
-    if (!el) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen?.();
-    } else {
-      el.requestFullscreen?.();
-    }
-  }, []);
-
-  // Keyboard shortcut: 'F' toggles lyric fullscreen (ignored when typing in inputs)
-  useEffect(() => {
-    const onKey = (e) => {
-      if (e.key !== "f" && e.key !== "F") return;
-      const tag = (e.target?.tagName || "").toLowerCase();
-      if (tag === "input" || tag === "textarea" || e.target?.isContentEditable) return;
-      e.preventDefault();
-      toggleLyricFullscreen();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [toggleLyricFullscreen]);
-
   // Presentation window: sync init (song + parsed lyrics) whenever song/alignment changes
   useEffect(() => {
     if (!song) return;
@@ -359,6 +328,20 @@ export default function Player({ song }) {
   const openPresentation = useCallback(async () => {
     try { await invoke("open_presentation_window"); setPresentOpen(true); }
     catch (e) { console.error("open_presentation_window", e); }
+  }, []);
+
+  // On mount: detect if presentation window is already open (e.g. song changed while window was open)
+  useEffect(() => {
+    invoke("is_presentation_open").then(open => {
+      if (!open) return;
+      setPresentOpen(true);
+      if (!song) return;
+      emit("karaoke://presentation-init", {
+        song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
+        lrcLines, wordsByLine: effectiveWordsByLine,
+      }).catch(() => {});
+    }).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const toggle = async () => {
@@ -468,7 +451,6 @@ export default function Player({ song }) {
             <Toggle label="Instrumental" active={preferInstrumental} onChange={() => setPreferInstrumental(v => !v)}/>
             <Toggle label="Challenge" active={challenge} icon="🏆" disabled={playing || !!sessionId} onChange={() => setChallenge(v => !v)}/>
             {wordTimestamps && <Toggle label="Word sync (Experimental)" active={wordSync} icon="◉" onChange={() => setWordSync(v => !v)}/>}
-            <Toggle label={isLyricFullscreen ? "Exit fullscreen" : "Fullscreen"} active={isLyricFullscreen} icon="⛶" onChange={toggleLyricFullscreen}/>
             <Toggle label={presentOpen ? "Presentation ON" : "Presentation"} active={presentOpen} icon="📺" onChange={openPresentation}/>
           </div>
         </div>
@@ -491,10 +473,10 @@ export default function Player({ song }) {
       </div>
 
       {/* Stage + side panel */}
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: isLyricFullscreen ? "1fr" : "1fr 260px", gap: 14, minHeight: 0 }}>
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 260px", gap: 14, minHeight: 0 }}>
         {/* Lyric stage */}
         <div ref={stageRef} style={{
-          position: "relative", borderRadius: isLyricFullscreen ? 0 : 20, overflow: "hidden",
+          position: "relative", borderRadius: 20, overflow: "hidden",
           background: "radial-gradient(ellipse at 50% 30%, rgba(255,107,90,0.1), rgba(7,6,12,0) 55%), linear-gradient(180deg, #0D0B18 0%, #07060C 100%)",
           border: "1px solid rgba(255,255,255,0.06)",
           display: "flex", flexDirection: "column", minHeight: 0,
@@ -504,16 +486,16 @@ export default function Player({ song }) {
           <div style={{ position: "absolute", top: -60, right: -40, width: 280, height: 280, background: "radial-gradient(circle, rgba(242,61,109,0.15), transparent 70%)", filter: "blur(20px)", animation: "floaty 8s ease-in-out infinite reverse", pointerEvents: "none" }}/>
 
           {synced ? (
-            <div style={{ flex: 1, overflowY: "auto", padding: isLyricFullscreen ? "0 6vmin" : "0 40px", scrollBehavior: "smooth", scrollbarWidth: "none" }}
+            <div style={{ flex: 1, overflowY: "auto", padding: "0 40px", scrollBehavior: "smooth", scrollbarWidth: "none" }}
               className="lyrics-scroll">
               <div style={{ height: "40%", flexShrink: 0 }}/>
               {lrcLines.map((line, i) => {
                 const isCurrent = i === currentIdx;
                 const isPast = i < currentIdx;
                 const isAdjacent = i === currentIdx + 1 || i === currentIdx - 1;
-                const fsCurrent = isLyricFullscreen ? "clamp(40px, 9vmin, 160px)" : "clamp(32px, 6.5vmin, 120px)";
-                const fsAdjacent = isLyricFullscreen ? "clamp(22px, 4.2vmin, 72px)" : "clamp(18px, 3vmin, 56px)";
-                const fsFar = isLyricFullscreen ? "clamp(16px, 3vmin, 52px)" : "clamp(14px, 2.3vmin, 44px)";
+                const fsCurrent = "clamp(32px, 6.5vmin, 120px)";
+                const fsAdjacent = "clamp(18px, 3vmin, 56px)";
+                const fsFar = "clamp(14px, 2.3vmin, 44px)";
                 const lineWords = isCurrent && wordSync
                   ? (effectiveWordsByLine?.[i]?.length > 0
                     ? effectiveWordsByLine[i]

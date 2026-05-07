@@ -73,8 +73,8 @@ export default function PresentationView() {
             const isCurrent = i === currentIdx;
             const isPast = i < currentIdx;
             const isAdjacent = i === currentIdx + 1 || i === currentIdx - 1;
-            const lineWords = isCurrent
-              ? (wordsByLine?.[i]?.length > 0
+            const lineWords = (isCurrent && wordsByLine)
+              ? (wordsByLine[i]?.length > 0
                 ? wordsByLine[i]
                 : line.text.trim().split(/\s+/).map(w => ({ word: w })))
               : null;
