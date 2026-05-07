@@ -1,5 +1,6 @@
 mod aligner;
 mod audio;
+mod cloud;
 mod downloader;
 mod jobs;
 mod leaderboard;
@@ -93,11 +94,24 @@ pub fn run() {
             open_presentation_window,
             close_presentation_window,
             is_presentation_open,
+            cloud::cloud_get_settings,
+            cloud::cloud_save_credentials,
+            cloud::cloud_check_status,
+            cloud::cloud_login,
+            cloud::cloud_logout,
+            cloud::cloud_sync_song,
+            cloud::cloud_sync_all,
+            cloud::cloud_download_song,
+            cloud::cloud_delete_song,
+            cloud::cloud_make_local_only,
+            cloud::cloud_list_remote_songs,
+            cloud::cloud_restore_song,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
             library::ensure_library(&handle)?;
             jobs::init(&handle);
+            cloud::init(&handle);
             recorder::init(&handle);
             pitch::init(&handle);
             if let Err(e) = leaderboard::init(&handle) {

@@ -73,6 +73,36 @@ function GhostBtn({ children, onClick, danger }) {
   );
 }
 
+const inputStyle = {
+  background: "rgba(255,255,255,0.04)",
+  border: "1px solid rgba(255,255,255,0.08)",
+  borderRadius: 8,
+  padding: "6px 12px",
+  fontSize: 12.5,
+  color: "#FFF",
+  outline: "none",
+  fontFamily: "var(--font-sans)",
+  width: 210,
+};
+
+function ToggleSwitch({ checked, onChange }) {
+  return (
+    <div onClick={onChange} style={{
+      width: 40, height: 22, borderRadius: 11, cursor: "pointer", flexShrink: 0,
+      background: checked ? CK_GRADIENT : "rgba(255,255,255,0.12)",
+      border: "1px solid rgba(255,255,255,0.1)",
+      position: "relative", transition: "background 200ms",
+    }}>
+      <div style={{
+        position: "absolute", top: 2, left: checked ? 18 : 2,
+        width: 16, height: 16, borderRadius: "50%",
+        background: "#FFF", boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
+        transition: "left 200ms",
+      }}/>
+    </div>
+  );
+}
+
 export default function Settings() {
   const [cookieBrowser, setCookieBrowser] = useState("safari");
   const [cookiesFile, setCookiesFile] = useState(null);
@@ -83,6 +113,15 @@ export default function Settings() {
   const [micDevices, setMicDevices] = useState([]);
   const [micDevice, setMicDevice] = useState(null); // null = system default
 
+  // MEGA state
+  const [megaEmail, setMegaEmail] = useState("");
+  const [megaPassword, setMegaPassword] = useState("");
+  const [megaMfa, setMegaMfa] = useState("");
+  const [megaAutoSync, setMegaAutoSync] = useState(false);
+  const [megaStatus, setMegaStatus] = useState(null); // { available, logged_in, account }
+  const [megaMsg, setMegaMsg] = useState({ text: "", type: "idle" }); // type: idle|ok|error|loading
+  const [megaSaving, setMegaSaving] = useState(false);
+
   useEffect(() => {
     invoke("get_cookie_browser").then(setCookieBrowser).catch(console.error);
     invoke("get_cookies_file").then(setCookiesFile).catch(console.error);
@@ -90,6 +129,13 @@ export default function Settings() {
     invoke("get_alignment_mode").then(setAlignmentMode).catch(console.error);
     invoke("list_mic_devices").then(setMicDevices).catch(console.error);
     invoke("get_mic_device").then(setMicDevice).catch(console.error);
+    invoke("cloud_get_settings").then((s) => {
+      setMegaEmail(s.email || "");
+      setMegaPassword(s.password || "");
+      setMegaMfa(s.mfa || "");
+      setMegaAutoSync(s.auto_sync || false);
+    }).catch(console.error);
+    invoke("cloud_check_status").then(setMegaStatus).catch(console.error);
   }, []);
 
   async function selectMicDevice(name) {
@@ -130,6 +176,41 @@ export default function Settings() {
   async function clearCookiesFile() {
     try { await invoke("set_cookies_file", { path: null }); setCookiesFile(null); }
     catch (e) { setError(String(e)); }
+  }
+
+  async function saveMegaCredentials() {
+    setMegaSaving(true); setMegaMsg({ text: "Salvando...", type: "loading" });
+    try {
+      await invoke("cloud_save_credentials", { email: megaEmail, password: megaPassword, mfa: megaMfa, autoSync: megaAutoSync });
+      setMegaMsg({ text: "Salvato", type: "ok" });
+    } catch (e) {
+      setMegaMsg({ text: String(e), type: "error" });
+    } finally { setMegaSaving(false); }
+  }
+
+  async function megaLogin() {
+    setMegaMsg({ text: "Login...", type: "loading" });
+    try {
+      const account = await invoke("cloud_login");
+      setMegaStatus((prev) => ({ ...prev, logged_in: true, account }));
+      setMegaMsg({ text: `Connesso come ${account}`, type: "ok" });
+    } catch (e) { setMegaMsg({ text: String(e), type: "error" }); }
+  }
+
+  async function megaLogout() {
+    try {
+      await invoke("cloud_logout");
+      setMegaStatus((prev) => ({ ...prev, logged_in: false, account: null }));
+      setMegaMsg({ text: "Disconnesso", type: "ok" });
+    } catch (e) { setMegaMsg({ text: String(e), type: "error" }); }
+  }
+
+  async function megaSyncAll() {
+    setMegaMsg({ text: "Sync in corso...", type: "loading" });
+    try {
+      await invoke("cloud_sync_all");
+      setMegaMsg({ text: "Sync completato", type: "ok" });
+    } catch (e) { setMegaMsg({ text: String(e), type: "error" }); }
   }
 
   return (
@@ -240,6 +321,114 @@ export default function Settings() {
             ))}
           </>
         )}
+      </SettingGroup>
+
+      {/* MEGA cloud sync */}
+      <SettingGroup title="MEGA.nz Cloud Sync">
+        {/* MEGAcmd status indicator */}
+        <SettingRow
+          label="MEGAcmd"
+          hint={
+            megaStatus === null
+              ? "Verifica in corso..."
+              : megaStatus.available
+              ? megaStatus.logged_in
+                ? `Connesso come ${megaStatus.account}`
+                : `Installato (${megaStatus.path}) — non autenticato`
+              : "Non trovato. Installa con: brew install --cask megacmd"
+          }
+          control={
+            <div style={{
+              width: 10, height: 10, borderRadius: "50%", flexShrink: 0,
+              background: megaStatus === null
+                ? "rgba(255,255,255,0.3)"
+                : megaStatus.available
+                ? megaStatus.logged_in ? "#22D3A4" : "#FFB370"
+                : "#F23D6D",
+              boxShadow: megaStatus?.logged_in ? "0 0 8px #22D3A4" : "none",
+            }}/>
+          }
+        />
+        <SettingRow
+          label="Email"
+          hint="Account MEGA.nz"
+          control={
+            <input
+              type="email"
+              value={megaEmail}
+              onChange={(e) => setMegaEmail(e.target.value)}
+              placeholder="you@example.com"
+              style={inputStyle}
+            />
+          }
+        />
+        <SettingRow
+          label="Password"
+          hint="Salvata in app_settings.json"
+          control={
+            <input
+              type="password"
+              value={megaPassword}
+              onChange={(e) => setMegaPassword(e.target.value)}
+              placeholder="••••••••"
+              style={inputStyle}
+            />
+          }
+        />
+        <SettingRow
+          label="Codice 2FA"
+          hint="Solo se 2FA abilitato sull'account (TOTP a 6 cifre). Lascia vuoto se non usi 2FA."
+          control={
+            <input
+              type="text"
+              value={megaMfa}
+              onChange={(e) => setMegaMfa(e.target.value)}
+              placeholder="123456"
+              maxLength={6}
+              style={{ ...inputStyle, width: 90, fontFamily: "var(--font-mono)", letterSpacing: 3 }}
+            />
+          }
+        />
+        <SettingRow
+          label="Auto-sync dopo processing"
+          hint="Carica su MEGA automaticamente quando la pipeline finisce"
+          last
+          control={
+            <ToggleSwitch
+              checked={megaAutoSync}
+              onChange={() => setMegaAutoSync((v) => !v)}
+            />
+          }
+        />
+        <div style={{
+          padding: "12px 18px",
+          display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8,
+          borderTop: "1px solid rgba(255,255,255,0.04)",
+        }}>
+          <GhostBtn onClick={saveMegaCredentials} disabled={megaSaving}>
+            {megaSaving ? "Salvando…" : "Salva"}
+          </GhostBtn>
+          {megaStatus?.available && !megaStatus.logged_in && (
+            <GhostBtn onClick={megaLogin}>Login</GhostBtn>
+          )}
+          {megaStatus?.logged_in && (
+            <>
+              <GhostBtn onClick={megaLogout} danger>Logout</GhostBtn>
+              <GhostBtn onClick={megaSyncAll}>Sync all ora</GhostBtn>
+            </>
+          )}
+          {megaMsg.text && (
+            <span style={{
+              fontSize: 12,
+              color: megaMsg.type === "ok" ? "#22D3A4"
+                : megaMsg.type === "error" ? "#F23D6D"
+                : "rgba(237,233,255,0.5)",
+              flex: 1,
+            }}>
+              {megaMsg.text}
+            </span>
+          )}
+        </div>
       </SettingGroup>
 
       {/* YouTube cookies section */}

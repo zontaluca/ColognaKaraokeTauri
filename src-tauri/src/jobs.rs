@@ -152,24 +152,49 @@ fn spawn_worker(app: AppHandle, state: JobQueueState) {
 
             let res = pipeline::run_pipeline(app.clone(), url, on_progress).await;
 
-            let mut q = state.lock();
-            if let Some(j) = q.jobs.iter_mut().find(|j| j.id == id) {
-                match res {
-                    Ok(meta) => {
-                        j.status = "done".into();
-                        j.progress = 1.0;
-                        j.message = "Done".into();
-                        j.result = Some(meta);
-                    }
-                    Err(e) => {
-                        j.status = "error".into();
-                        j.error = Some(e.clone());
-                        j.message = e;
-                    }
-                }
-                let j2 = j.clone();
-                emit_job(&app, &j2);
+            let maybe_song_dir: Option<String> = {
+                let mut q = state.lock();
+                let maybe = if let Some(j) = q.jobs.iter_mut().find(|j| j.id == id) {
+                    let dir = match &res {
+                        Ok(meta) => {
+                            let d = meta
+                                .get("_pipeline_dir")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            j.status = "done".into();
+                            j.progress = 1.0;
+                            j.message = "Done".into();
+                            j.result = Some(meta.clone());
+                            d
+                        }
+                        Err(e) => {
+                            j.status = "error".into();
+                            j.error = Some(e.clone());
+                            j.message = e.clone();
+                            None
+                        }
+                    };
+                    let j2 = j.clone();
+                    emit_job(&app, &j2);
+                    dir
+                } else {
+                    None
+                };
                 emit_list(&app, &q);
+                maybe
+            };
+
+            // Auto-sync outside the lock so we don't hold it during network I/O
+            if let Some(song_dir) = maybe_song_dir {
+                let settings = crate::settings::load_settings(&app);
+                if settings.mega.auto_sync && settings.mega.email.is_some() {
+                    let app2 = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if crate::cloud::is_network_available().await {
+                            let _ = crate::cloud::upload_song(&app2, song_dir).await;
+                        }
+                    });
+                }
             }
         }
     });

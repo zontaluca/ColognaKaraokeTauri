@@ -192,6 +192,11 @@ where
     save_metadata(&final_song_dir, &meta)?;
 
     on_progress(6, "done", "Done!", 1.0);
+    // Embed dir for post-pipeline hooks (jobs.rs auto-sync); not written to disk
+    meta.as_object_mut().unwrap().insert(
+        "_pipeline_dir".into(),
+        final_song_dir.to_string_lossy().into_owned().into(),
+    );
     Ok(meta)
 }
 

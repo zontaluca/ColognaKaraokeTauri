@@ -100,6 +100,20 @@ impl WhisperModelChoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MegaSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Stored plaintext in app_settings.json; user is informed in Settings UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// TOTP 2FA code (6-digit); only needed once per device, MEGAcmd stores the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa: Option<String>,
+    #[serde(default)]
+    pub auto_sync: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppSettings {
     #[serde(default)]
     pub cookie_browser: CookieBrowser,
@@ -113,6 +127,8 @@ pub struct AppSettings {
     /// Preferred microphone device name; None = system default
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mic_device: Option<String>,
+    #[serde(default)]
+    pub mega: MegaSettings,
 }
 
 fn settings_path(app: &AppHandle) -> PathBuf {

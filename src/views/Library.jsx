@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -24,6 +24,34 @@ function formatDuration(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
+function CloudIcon({ size = 12 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <path d="M18 10a6 6 0 00-11.47-2.44A5 5 0 107 20h11a4 4 0 000-8z"
+        stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  );
+}
+
+function CloudBadge({ song }) {
+  if (!song.cloud_synced && !song.local_deleted) return null;
+  const isCloudOnly = song.local_deleted;
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 3,
+      padding: "3px 7px", borderRadius: 999,
+      fontSize: 9.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase",
+      background: isCloudOnly ? "rgba(34,211,164,0.15)" : "rgba(96,200,255,0.12)",
+      color: isCloudOnly ? "#22D3A4" : "#60C8FF",
+      border: `1px solid ${isCloudOnly ? "rgba(34,211,164,0.3)" : "rgba(96,200,255,0.25)"}`,
+      flexShrink: 0,
+    }}>
+      <CloudIcon size={9}/>
+      {isCloudOnly ? "Cloud only" : "Synced"}
+    </span>
+  );
+}
+
 function LrcBadge({ song }) {
   if (!song.lrc) return null;
   return (
@@ -43,21 +71,46 @@ function LrcBadge({ song }) {
 
 function TrackCard({ song, onPlay, onDelete, onReprocess }) {
   const [hovered, setHovered] = useState(false);
+  // confirming: false | "local" | "everywhere"
   const [confirming, setConfirming] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
   const [reprocessMsg, setReprocessMsg] = useState("");
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudMsg, setCloudMsg] = useState("");
   const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
   const bg = coverSrc ? `url(${coverSrc}) center/cover no-repeat` : coverGradient(song._dir || "x");
 
   const handleDelete = async (e) => {
     e.stopPropagation();
-    if (!confirming) { setConfirming(true); return; }
+    if (song.cloud_synced) {
+      // Synced song: first confirm, then offer local-only vs everywhere
+      if (!confirming) { setConfirming("choose"); return; }
+      if (confirming === "choose") return; // wait for sub-choice
+      if (confirming === "local") {
+        // Keep on cloud, just remove local files
+        try {
+          await invoke("cloud_make_local_only", { dir: song._dir });
+          await onReprocess?.(song._dir);
+        } catch (err) { console.error(err); }
+        setConfirming(false);
+        return;
+      }
+      if (confirming === "everywhere") {
+        try {
+          await invoke("cloud_delete_song", { dir: song._dir });
+          await invoke("delete_song", { dir: song._dir });
+          onDelete(song._dir);
+        } catch (err) { console.error(err); }
+        setConfirming(false);
+        return;
+      }
+    }
+    // Not synced: normal delete
+    if (!confirming) { setConfirming("confirm"); return; }
     try {
       await invoke("delete_song", { dir: song._dir });
       onDelete(song._dir);
-    } catch (err) {
-      console.error("delete_song failed", err);
-    }
+    } catch (err) { console.error("delete_song failed", err); }
   };
 
   const handleReprocess = async (e) => {
@@ -83,18 +136,52 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
     }
   };
 
+  const handleCloudSync = async (e) => {
+    e.stopPropagation();
+    if (cloudBusy) return;
+    setCloudBusy(true); setCloudMsg("Sync...");
+    try {
+      await invoke("cloud_sync_song", { dir: song._dir });
+      setCloudMsg("Synced!");
+      await onReprocess?.(song._dir);
+    } catch (err) { setCloudMsg("Errore: " + err); }
+    finally { setTimeout(() => { setCloudBusy(false); setCloudMsg(""); }, 2000); }
+  };
+
+  const handleCloudDownload = async (e) => {
+    e.stopPropagation();
+    if (cloudBusy) return;
+    setCloudBusy(true); setCloudMsg("Download...");
+    try {
+      await invoke("cloud_download_song", { dir: song._dir });
+      setCloudMsg("Scaricato!");
+      await onReprocess?.(song._dir);
+    } catch (err) { setCloudMsg("Errore: " + err); }
+    finally { setTimeout(() => { setCloudBusy(false); setCloudMsg(""); }, 2000); }
+  };
+
+  const handleMakeCloudOnly = async (e) => {
+    e.stopPropagation();
+    if (!song.cloud_synced) { setCloudMsg("Prima sincronizza!"); return; }
+    try {
+      await invoke("cloud_make_local_only", { dir: song._dir });
+      await onReprocess?.(song._dir);
+    } catch (err) { setCloudMsg("Errore: " + err); }
+  };
+
   return (
     <div
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => { setHovered(false); setConfirming(false); }}
-      onClick={() => onPlay(song)}
+      onClick={() => { if (!song.local_deleted) onPlay(song); }}
       style={{
         borderRadius: 16, overflow: "hidden",
         background: "rgba(255,255,255,0.03)",
-        border: "1px solid rgba(255,255,255,0.06)",
-        transition: "all 180ms ease", cursor: "pointer",
-        transform: hovered ? "translateY(-4px)" : "translateY(0)",
-        boxShadow: hovered ? "0 16px 32px rgba(0,0,0,0.4)" : "none",
+        border: song.local_deleted ? "1px solid rgba(34,211,164,0.2)" : "1px solid rgba(255,255,255,0.06)",
+        transition: "all 180ms ease",
+        cursor: song.local_deleted ? "default" : "pointer",
+        transform: hovered && !song.local_deleted ? "translateY(-4px)" : "translateY(0)",
+        boxShadow: hovered && !song.local_deleted ? "0 16px 32px rgba(0,0,0,0.4)" : "none",
       }}
     >
       <div style={{ position: "relative", aspectRatio: "1", background: bg }}>
@@ -103,19 +190,33 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
           background: "linear-gradient(180deg, transparent 40%, rgba(0,0,0,0.6) 100%)",
           opacity: hovered ? 1 : 0.7, transition: "opacity 180ms",
         }}/>
-        <div style={{
-          position: "absolute", bottom: 10, right: 10,
-          width: 40, height: 40, borderRadius: "50%",
-          background: CK_GRADIENT,
-          display: "flex", alignItems: "center", justifyContent: "center",
-          boxShadow: "0 8px 20px rgba(242,61,109,0.45)",
-          transform: hovered ? "scale(1.15)" : "scale(1)",
-          transition: "transform 180ms ease",
-        }}>
-          <svg width="14" height="14" viewBox="0 0 24 24"><path d="M7 4.5v15L20 12 7 4.5z" fill="#FFF"/></svg>
-        </div>
-        <div style={{ position: "absolute", top: 10, left: 10 }}>
+        {song.local_deleted ? (
+          <div style={{
+            position: "absolute", bottom: 10, right: 10,
+            padding: "6px 10px", borderRadius: 8,
+            background: "rgba(34,211,164,0.18)",
+            border: "1px solid rgba(34,211,164,0.3)",
+            display: "flex", alignItems: "center", gap: 4,
+            fontSize: 11, fontWeight: 700, color: "#22D3A4",
+          }}>
+            <CloudIcon size={11}/> Cloud only
+          </div>
+        ) : (
+          <div style={{
+            position: "absolute", bottom: 10, right: 10,
+            width: 40, height: 40, borderRadius: "50%",
+            background: CK_GRADIENT,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            boxShadow: "0 8px 20px rgba(242,61,109,0.45)",
+            transform: hovered ? "scale(1.15)" : "scale(1)",
+            transition: "transform 180ms ease",
+          }}>
+            <svg width="14" height="14" viewBox="0 0 24 24"><path d="M7 4.5v15L20 12 7 4.5z" fill="#FFF"/></svg>
+          </div>
+        )}
+        <div style={{ position: "absolute", top: 10, left: 10, display: "flex", gap: 4, flexWrap: "wrap" }}>
           <LrcBadge song={song}/>
+          <CloudBadge song={song}/>
         </div>
       </div>
       <div style={{ padding: 14 }}>
@@ -130,39 +231,78 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
         <div style={{ marginTop: 4, fontSize: 12, color: "rgba(237,233,255,0.55)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {song.artist || "Unknown"}
         </div>
-        <div style={{ display: "flex", gap: 6, marginTop: 10, alignItems: "center" }}>
-          <button
-            onClick={handleDelete}
-            onBlur={() => setConfirming(false)}
-            style={{
-              all: "unset", cursor: "pointer",
-              fontSize: 11, padding: "4px 10px", borderRadius: 6,
-              background: confirming ? "rgba(242,61,109,0.2)" : "rgba(255,255,255,0.04)",
-              color: confirming ? "#F23D6D" : "rgba(237,233,255,0.45)",
-              border: confirming ? "1px solid rgba(242,61,109,0.3)" : "1px solid rgba(255,255,255,0.06)",
-              transition: "all 140ms",
-            }}
-          >
-            {confirming ? "Confirm?" : "Delete"}
-          </button>
-          {reprocessing ? (
-            <span style={{ fontSize: 10.5, color: "rgba(237,233,255,0.55)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
-              {reprocessMsg}
-            </span>
-          ) : (
-            <button
-              onClick={handleReprocess}
-              title="Re-process lyrics & alignment"
-              style={{
-                all: "unset", cursor: "pointer",
-                fontSize: 11, padding: "4px 10px", borderRadius: 6,
-                background: "rgba(255,255,255,0.04)",
-                color: "rgba(237,233,255,0.45)",
-                border: "1px solid rgba(255,255,255,0.06)",
-              }}
-            >
-              ↻ Re-process
+        <div style={{ display: "flex", gap: 6, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}>
+          {!song.local_deleted && (
+            confirming === "choose" ? (
+              <div style={{ display: "flex", gap: 4 }}>
+                <button onClick={(e) => { e.stopPropagation(); setConfirming("local"); handleDelete(e); }}
+                  style={{ all: "unset", cursor: "pointer", fontSize: 10, padding: "4px 8px", borderRadius: 6, background: "rgba(255,183,112,0.15)", color: "#FFB370", border: "1px solid rgba(255,183,112,0.3)" }}>
+                  Solo locale
+                </button>
+                <button onClick={(e) => { e.stopPropagation(); setConfirming("everywhere"); handleDelete(e); }}
+                  style={{ all: "unset", cursor: "pointer", fontSize: 10, padding: "4px 8px", borderRadius: 6, background: "rgba(242,61,109,0.15)", color: "#F23D6D", border: "1px solid rgba(242,61,109,0.3)" }}>
+                  Ovunque
+                </button>
+                <button onClick={(e) => { e.stopPropagation(); setConfirming(false); }}
+                  style={{ all: "unset", cursor: "pointer", fontSize: 10, padding: "4px 8px", borderRadius: 6, background: "rgba(255,255,255,0.04)", color: "rgba(237,233,255,0.45)", border: "1px solid rgba(255,255,255,0.06)" }}>
+                  ✕
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={handleDelete}
+                onBlur={() => setConfirming(false)}
+                style={{
+                  all: "unset", cursor: "pointer",
+                  fontSize: 11, padding: "4px 10px", borderRadius: 6,
+                  background: confirming ? "rgba(242,61,109,0.2)" : "rgba(255,255,255,0.04)",
+                  color: confirming ? "#F23D6D" : "rgba(237,233,255,0.45)",
+                  border: confirming ? "1px solid rgba(242,61,109,0.3)" : "1px solid rgba(255,255,255,0.06)",
+                  transition: "all 140ms",
+                }}
+              >
+                {confirming === "confirm" ? "Confirm?" : "Delete"}
+              </button>
+            )
+          )}
+          {cloudBusy ? (
+            <span style={{ fontSize: 10.5, color: "rgba(237,233,255,0.55)", flex: 1 }}>{cloudMsg}</span>
+          ) : song.local_deleted ? (
+            <button onClick={handleCloudDownload} style={smallBtnStyle}>
+              <CloudIcon size={10}/> Download
             </button>
+          ) : song.cloud_synced ? (
+            <button onClick={handleMakeCloudOnly} title="Rimuovi file locali" style={smallBtnStyle}>
+              <CloudIcon size={10}/> Cloud only
+            </button>
+          ) : (
+            <button onClick={handleCloudSync} style={smallBtnStyle}>
+              <CloudIcon size={10}/> Sync
+            </button>
+          )}
+          {cloudMsg && !cloudBusy && (
+            <span style={{ fontSize: 10.5, color: "rgba(237,233,255,0.45)" }}>{cloudMsg}</span>
+          )}
+          {!song.local_deleted && !cloudBusy && (
+            reprocessing ? (
+              <span style={{ fontSize: 10.5, color: "rgba(237,233,255,0.55)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+                {reprocessMsg}
+              </span>
+            ) : (
+              <button
+                onClick={handleReprocess}
+                title="Re-process lyrics & alignment"
+                style={{
+                  all: "unset", cursor: "pointer",
+                  fontSize: 11, padding: "4px 10px", borderRadius: 6,
+                  background: "rgba(255,255,255,0.04)",
+                  color: "rgba(237,233,255,0.45)",
+                  border: "1px solid rgba(255,255,255,0.06)",
+                }}
+              >
+                ↻ Re-process
+              </button>
+            )
           )}
         </div>
       </div>
@@ -170,17 +310,49 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
   );
 }
 
+const smallBtnStyle = {
+  all: "unset", cursor: "pointer",
+  display: "inline-flex", alignItems: "center", gap: 4,
+  fontSize: 11, padding: "4px 10px", borderRadius: 6,
+  background: "rgba(255,255,255,0.04)",
+  color: "rgba(237,233,255,0.45)",
+  border: "1px solid rgba(255,255,255,0.06)",
+};
+
 function TrackRow({ song, onPlay, onDelete, onReprocess }) {
   const [hovered, setHovered] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
   const [reprocessMsg, setReprocessMsg] = useState("");
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudMsg, setCloudMsg] = useState("");
   const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
   const bg = coverSrc ? `url(${coverSrc}) center/cover no-repeat` : coverGradient(song._dir || "x");
 
   const handleDelete = async (e) => {
     e.stopPropagation();
-    if (!confirming) { setConfirming(true); return; }
+    if (song.cloud_synced && !song.local_deleted) {
+      if (!confirming) { setConfirming("choose"); return; }
+      if (confirming === "choose") return;
+      if (confirming === "local") {
+        try {
+          await invoke("cloud_make_local_only", { dir: song._dir });
+          await onReprocess?.(song._dir);
+        } catch (err) { console.error("make_cloud_only failed", err); }
+        setConfirming(false);
+        return;
+      }
+      if (confirming === "everywhere") {
+        try {
+          await invoke("cloud_delete_song", { dir: song._dir });
+          await invoke("delete_song", { dir: song._dir });
+          onDelete(song._dir);
+        } catch (err) { console.error("delete everywhere failed", err); }
+        setConfirming(false);
+        return;
+      }
+    }
+    if (!confirming) { setConfirming("confirm"); return; }
     try {
       await invoke("delete_song", { dir: song._dir });
       onDelete(song._dir);
@@ -212,14 +384,48 @@ function TrackRow({ song, onPlay, onDelete, onReprocess }) {
     }
   };
 
+  const handleCloudSync = async (e) => {
+    e.stopPropagation();
+    if (cloudBusy) return;
+    setCloudBusy(true); setCloudMsg("Sync...");
+    try {
+      await invoke("cloud_sync_song", { dir: song._dir });
+      setCloudMsg("Synced!");
+      await onReprocess?.(song._dir);
+    } catch (err) { setCloudMsg("Errore: " + err); }
+    finally { setTimeout(() => { setCloudBusy(false); setCloudMsg(""); }, 2000); }
+  };
+
+  const handleCloudDownload = async (e) => {
+    e.stopPropagation();
+    if (cloudBusy) return;
+    setCloudBusy(true); setCloudMsg("Download...");
+    try {
+      await invoke("cloud_download_song", { dir: song._dir });
+      setCloudMsg("Scaricato!");
+      await onReprocess?.(song._dir);
+    } catch (err) { setCloudMsg("Errore: " + err); }
+    finally { setTimeout(() => { setCloudBusy(false); setCloudMsg(""); }, 2000); }
+  };
+
+  const handleMakeCloudOnly = async (e) => {
+    e.stopPropagation();
+    if (!song.cloud_synced) { setCloudMsg("Prima sincronizza!"); return; }
+    try {
+      await invoke("cloud_make_local_only", { dir: song._dir });
+      await onReprocess?.(song._dir);
+    } catch (err) { setCloudMsg("Errore: " + err); }
+  };
+
   return (
     <div
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => { setHovered(false); setConfirming(false); }}
-      onClick={() => onPlay(song)}
+      onClick={() => { if (!song.local_deleted) onPlay(song); }}
       style={{
         display: "flex", alignItems: "center", gap: 12,
-        padding: "8px 12px", borderRadius: 10, cursor: "pointer",
+        padding: "8px 12px", borderRadius: 10,
+        cursor: song.local_deleted ? "default" : "pointer",
         background: hovered ? "rgba(255,255,255,0.05)" : "transparent",
         transition: "background 140ms",
       }}
@@ -230,13 +436,23 @@ function TrackRow({ song, onPlay, onDelete, onReprocess }) {
         background: bg,
         position: "relative", overflow: "hidden",
       }}>
-        {hovered && (
+        {hovered && !song.local_deleted && (
           <div style={{
             position: "absolute", inset: 0,
             background: "rgba(0,0,0,0.45)",
             display: "flex", alignItems: "center", justifyContent: "center",
           }}>
             <svg width="12" height="12" viewBox="0 0 24 24"><path d="M7 4.5v15L20 12 7 4.5z" fill="#FFF"/></svg>
+          </div>
+        )}
+        {song.local_deleted && (
+          <div style={{
+            position: "absolute", inset: 0,
+            background: "rgba(34,211,164,0.12)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            color: "#22D3A4",
+          }}>
+            <CloudIcon size={16}/>
           </div>
         )}
       </div>
@@ -251,8 +467,9 @@ function TrackRow({ song, onPlay, onDelete, onReprocess }) {
         </div>
       </div>
 
-      {/* Badge */}
+      {/* Badges */}
       <LrcBadge song={song}/>
+      <CloudBadge song={song}/>
 
       {/* Duration */}
       <span style={{ fontSize: 11, color: "rgba(237,233,255,0.4)", fontFamily: "var(--font-mono)", flexShrink: 0, width: 36, textAlign: "right" }}>
@@ -264,37 +481,73 @@ function TrackRow({ song, onPlay, onDelete, onReprocess }) {
         display: "flex", gap: 4, flexShrink: 0,
         opacity: hovered ? 1 : 0, transition: "opacity 140ms",
       }} onClick={e => e.stopPropagation()}>
-        {reprocessing ? (
-          <span style={{ fontSize: 10, color: "rgba(237,233,255,0.5)", maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {reprocessMsg}
-          </span>
+        {cloudBusy ? (
+          <span style={{ fontSize: 10, color: "rgba(237,233,255,0.5)", maxWidth: 80 }}>{cloudMsg}</span>
+        ) : song.local_deleted ? (
+          <button onClick={handleCloudDownload} style={{ ...smallBtnStyle, fontSize: 10.5, padding: "3px 8px", display: "inline-flex", gap: 3 }}>
+            <CloudIcon size={9}/> ↓
+          </button>
+        ) : song.cloud_synced ? (
+          <button onClick={handleMakeCloudOnly} title="Cloud only" style={{ all: "unset", cursor: "pointer", fontSize: 10.5, padding: "3px 8px", borderRadius: 5, background: "rgba(96,200,255,0.08)", color: "#60C8FF", border: "1px solid rgba(96,200,255,0.2)", display: "inline-flex", alignItems: "center", gap: 3 }}>
+            <CloudIcon size={9}/>
+          </button>
         ) : (
-          <button
-            onClick={handleReprocess}
-            title="Re-process"
-            style={{
-              all: "unset", cursor: "pointer",
-              fontSize: 10.5, padding: "3px 8px", borderRadius: 5,
-              background: "rgba(255,255,255,0.04)",
-              color: "rgba(237,233,255,0.45)",
-              border: "1px solid rgba(255,255,255,0.06)",
-            }}
-          >↻</button>
+          <button onClick={handleCloudSync} title="Sync to MEGA" style={{ all: "unset", cursor: "pointer", fontSize: 10.5, padding: "3px 8px", borderRadius: 5, background: "rgba(255,255,255,0.04)", color: "rgba(237,233,255,0.45)", border: "1px solid rgba(255,255,255,0.06)", display: "inline-flex", alignItems: "center", gap: 3 }}>
+            <CloudIcon size={9}/>
+          </button>
         )}
-        <button
-          onClick={handleDelete}
-          onBlur={() => setConfirming(false)}
-          style={{
-            all: "unset", cursor: "pointer",
-            fontSize: 10.5, padding: "3px 8px", borderRadius: 5,
-            background: confirming ? "rgba(242,61,109,0.2)" : "rgba(255,255,255,0.04)",
-            color: confirming ? "#F23D6D" : "rgba(237,233,255,0.45)",
-            border: confirming ? "1px solid rgba(242,61,109,0.3)" : "1px solid rgba(255,255,255,0.06)",
-            transition: "all 140ms",
-          }}
-        >
-          {confirming ? "?" : "✕"}
-        </button>
+        {!song.local_deleted && (
+          reprocessing ? (
+            <span style={{ fontSize: 10, color: "rgba(237,233,255,0.5)", maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {reprocessMsg}
+            </span>
+          ) : (
+            <button
+              onClick={handleReprocess}
+              title="Re-process"
+              style={{
+                all: "unset", cursor: "pointer",
+                fontSize: 10.5, padding: "3px 8px", borderRadius: 5,
+                background: "rgba(255,255,255,0.04)",
+                color: "rgba(237,233,255,0.45)",
+                border: "1px solid rgba(255,255,255,0.06)",
+              }}
+            >↻</button>
+          )
+        )}
+        {!song.local_deleted && (
+          confirming === "choose" ? (
+            <>
+              <button onClick={(e) => { e.stopPropagation(); setConfirming("local"); handleDelete(e); }}
+                style={{ all:"unset", cursor:"pointer", fontSize:10.5, padding:"3px 8px", borderRadius:5, background:"rgba(255,183,112,0.15)", color:"#FFB370", border:"1px solid rgba(255,183,112,0.3)" }}>
+                Solo locale
+              </button>
+              <button onClick={(e) => { e.stopPropagation(); setConfirming("everywhere"); handleDelete(e); }}
+                style={{ all:"unset", cursor:"pointer", fontSize:10.5, padding:"3px 8px", borderRadius:5, background:"rgba(242,61,109,0.15)", color:"#F23D6D", border:"1px solid rgba(242,61,109,0.3)" }}>
+                Ovunque
+              </button>
+              <button onClick={(e) => { e.stopPropagation(); setConfirming(false); }}
+                style={{ all:"unset", cursor:"pointer", fontSize:10.5, padding:"3px 8px", borderRadius:5, background:"rgba(255,255,255,0.04)", color:"rgba(237,233,255,0.45)", border:"1px solid rgba(255,255,255,0.06)" }}>
+                ✕
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={handleDelete}
+              onBlur={() => setConfirming(false)}
+              style={{
+                all: "unset", cursor: "pointer",
+                fontSize: 10.5, padding: "3px 8px", borderRadius: 5,
+                background: confirming ? "rgba(242,61,109,0.2)" : "rgba(255,255,255,0.04)",
+                color: confirming ? "#F23D6D" : "rgba(237,233,255,0.45)",
+                border: confirming ? "1px solid rgba(242,61,109,0.3)" : "1px solid rgba(255,255,255,0.06)",
+                transition: "all 140ms",
+              }}
+            >
+              {confirming ? "?" : "✕"}
+            </button>
+          )
+        )}
       </div>
     </div>
   );
@@ -360,6 +613,8 @@ const FILTERS = [
   { id: "all",          label: "All" },
   { id: "lrc_enhanced", label: "LRC Enhanced" },
   { id: "lrc",          label: "LRC" },
+  { id: "cloud",        label: "Cloud" },
+  { id: "cloud_only",   label: "Cloud Only" },
 ];
 
 function letterKey(title) {
@@ -368,10 +623,85 @@ function letterKey(title) {
   return /[A-Z]/.test(upper) ? upper : "#";
 }
 
+function CloudOrphanRow({ safeName, onRestored }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const handleRestore = async (e) => {
+    e.stopPropagation();
+    if (busy) return;
+    setBusy(true); setMsg("Ripristino...");
+    try {
+      await invoke("cloud_restore_song", { safeName });
+      setMsg("Fatto!");
+      setTimeout(() => onRestored(), 800);
+    } catch (err) {
+      setMsg("Errore: " + err);
+      setTimeout(() => setBusy(false), 2000);
+    }
+  };
+
+  // Display a readable name from safe_name (e.g. "artist_-_title" → "artist - title")
+  const displayName = safeName.replace(/_-_/g, " - ").replace(/_/g, " ");
+
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 12,
+      padding: "8px 12px", borderRadius: 10,
+      background: "rgba(34,211,164,0.04)",
+      border: "1px solid rgba(34,211,164,0.12)",
+      marginBottom: 4,
+    }}>
+      <div style={{
+        width: 44, height: 44, borderRadius: 8, flexShrink: 0,
+        background: "rgba(34,211,164,0.1)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        color: "#22D3A4",
+      }}>
+        <CloudIcon size={18}/>
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "rgba(237,233,255,0.75)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {displayName}
+        </div>
+        <div style={{ fontSize: 11, color: "rgba(34,211,164,0.6)", marginTop: 2 }}>Solo su MEGA</div>
+      </div>
+      {busy ? (
+        <span style={{ fontSize: 11, color: "rgba(34,211,164,0.7)" }}>{msg}</span>
+      ) : (
+        <button onClick={handleRestore} style={{
+          all: "unset", cursor: "pointer",
+          display: "inline-flex", alignItems: "center", gap: 5,
+          fontSize: 11.5, fontWeight: 600, padding: "6px 14px", borderRadius: 8,
+          background: "rgba(34,211,164,0.12)",
+          color: "#22D3A4",
+          border: "1px solid rgba(34,211,164,0.25)",
+        }}>
+          <CloudIcon size={11}/> Scarica
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong, onReprocess }) {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("all");
   const [viewMode, setViewMode] = useState("list");
+  const [cloudOrphans, setCloudOrphans] = useState(null); // null=not loaded, []|[...]=loaded
+  const [loadingOrphans, setLoadingOrphans] = useState(false);
+
+  const fetchCloudOrphans = useCallback(async () => {
+    setLoadingOrphans(true);
+    try {
+      const orphans = await invoke("cloud_list_remote_songs");
+      setCloudOrphans(orphans);
+    } catch (e) {
+      setCloudOrphans([]);
+    } finally {
+      setLoadingOrphans(false);
+    }
+  }, []);
 
   const filtered = useMemo(() => {
     let list = songs;
@@ -379,6 +709,8 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
     if (needle) list = list.filter(s => (s.title || "").toLowerCase().includes(needle) || (s.artist || "").toLowerCase().includes(needle));
     if (filter === "lrc_enhanced") list = list.filter(s => s.lrc_enhanced);
     else if (filter === "lrc") list = list.filter(s => s.lrc && !s.lrc_enhanced);
+    else if (filter === "cloud") list = list.filter(s => s.cloud_synced);
+    else if (filter === "cloud_only") list = list.filter(s => s.local_deleted);
     return list;
   }, [songs, q, filter]);
 
@@ -410,7 +742,7 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
             Songs
           </h1>
           <div style={{ marginTop: 8, fontSize: 13.5, color: "rgba(237,233,255,0.55)", fontWeight: 500 }}>
-            {songs.length} tracks · {songs.filter(s => s.lrc_enhanced).length} word-synced · {songs.filter(s => s.lrc && !s.lrc_enhanced).length} line-synced
+            {songs.length} tracks · {songs.filter(s => s.lrc_enhanced).length} word-synced · {songs.filter(s => s.lrc && !s.lrc_enhanced).length} line-synced{songs.filter(s => s.cloud_synced || s.local_deleted).length > 0 ? ` · ${songs.filter(s => s.cloud_synced || s.local_deleted).length} su MEGA` : ""}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -526,6 +858,48 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
           <AddTrackRow onAdd={onAddSong}/>
         </div>
       )}
+
+      {/* Cloud orphans section */}
+      <div style={{ marginTop: 32 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.4, color: "#22D3A4", textTransform: "uppercase" }}>
+            Solo su MEGA
+          </div>
+          <button
+            onClick={fetchCloudOrphans}
+            disabled={loadingOrphans}
+            style={{
+              all: "unset", cursor: "pointer",
+              fontSize: 10.5, padding: "3px 10px", borderRadius: 6,
+              background: "rgba(34,211,164,0.08)",
+              color: "#22D3A4",
+              border: "1px solid rgba(34,211,164,0.2)",
+            }}
+          >
+            {loadingOrphans ? "Carico..." : cloudOrphans === null ? "Controlla MEGA" : "↻ Aggiorna"}
+          </button>
+        </div>
+        {cloudOrphans !== null && (
+          cloudOrphans.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: "rgba(237,233,255,0.35)", padding: "8px 0" }}>
+              Nessuna canzone orphan su MEGA.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {cloudOrphans.map((name) => (
+                <CloudOrphanRow
+                  key={name}
+                  safeName={name}
+                  onRestored={() => {
+                    setCloudOrphans((prev) => prev.filter((n) => n !== name));
+                    onRefresh();
+                  }}
+                />
+              ))}
+            </div>
+          )
+        )}
+      </div>
     </div>
   );
 }

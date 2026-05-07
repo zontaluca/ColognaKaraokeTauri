@@ -8,6 +8,7 @@ import Player from "./views/Player.jsx";
 import Leaderboard from "./views/Leaderboard.jsx";
 import Settings from "./views/Settings.jsx";
 import { JobsProvider, JobsToast } from "./jobsContext.jsx";
+import { CloudProvider, CloudToast } from "./cloudContext.jsx";
 import Background from "./components/Background.jsx";
 
 const CK_GRADIENT = "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)";
@@ -132,6 +133,7 @@ export default function App() {
   };
 
   const onJobDone = useCallback(() => { refreshLibrary(); }, [refreshLibrary]);
+  const onCloudSyncDone = useCallback(() => { refreshLibrary(); }, [refreshLibrary]);
 
   const refreshCurrentSong = useCallback(async () => {
     try {
@@ -150,6 +152,7 @@ export default function App() {
 
   return (
     <JobsProvider onJobDone={onJobDone}>
+    <CloudProvider onSyncDone={onCloudSyncDone}>
       <Background view={view} />
       <div className="app">
         <Sidebar view={view} onView={setView} currentSong={currentSong} isPlaying={isPlaying} />
@@ -180,6 +183,8 @@ export default function App() {
         />
       )}
       <JobsToast />
+      <CloudToast />
+    </CloudProvider>
     </JobsProvider>
   );
 }

@@ -78,6 +78,10 @@ pub fn scan_library(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
                         serde_json::Value::String(cover.to_string_lossy().into_owned()),
                     );
                 }
+                // Cloud sync fields — defaults for songs that predate the feature
+                obj.entry("cloud_synced").or_insert(false.into());
+                obj.entry("local_deleted").or_insert(false.into());
+                obj.entry("mega_remote_path").or_insert(serde_json::Value::Null);
             }
             songs.push(meta);
         }
