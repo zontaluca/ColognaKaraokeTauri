@@ -2,37 +2,78 @@ use std::path::Path;
 
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
-/// Load a WAV file, downmix to mono f32 at given target sample rate.
+/// Load an audio file (WAV or MP3), downmix to mono f32, return (samples, sample_rate).
 pub fn load_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
-    let reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    let sample_rate = spec.sample_rate;
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
 
-    let samples_f32: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .into_samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
-            .collect(),
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample as i32;
-            let max = (1i64 << (bits - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .map(|s| s.unwrap_or(0) as f32 / max)
-                .collect()
+    let src = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| e.to_string())?;
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or("no audio track")?
+        .clone();
+
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
+    let track_id = track.id;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| e.to_string())?;
+
+    let mut mono_samples: Vec<f32> = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        if packet.track_id() != track_id {
+            continue;
         }
-    };
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let spec = *decoded.spec();
+                let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                buf.copy_interleaved_ref(decoded);
+                for chunk in buf.samples().chunks(channels) {
+                    mono_samples.push(chunk.iter().sum::<f32>() / channels as f32);
+                }
+            }
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 
-    let mono: Vec<f32> = if channels <= 1 {
-        samples_f32
-    } else {
-        samples_f32
-            .chunks(channels)
-            .map(|c| c.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
-    Ok((mono, sample_rate))
+    if mono_samples.is_empty() {
+        return Err("decoded 0 samples".into());
+    }
+
+    Ok((mono_samples, sample_rate))
 }
 
 pub fn resample_to(input: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>, String> {

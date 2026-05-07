@@ -25,11 +25,11 @@ pub fn hz_to_midi(hz: f32) -> Option<f32> {
     if hz <= 0.0 { None } else { Some(69.0 + 12.0 * (hz / 440.0).log2()) }
 }
 
-/// Precompute reference pitch contour from vocals.wav → pitch.json.
+/// Precompute reference pitch contour from vocals.mp3 → pitch.json.
 pub async fn precompute_reference_pitch(dir: &Path) -> Result<(), String> {
-    let vocals = dir.join("vocals.wav");
+    let vocals = dir.join("vocals.mp3");
     if !vocals.exists() {
-        return Err("vocals.wav not found".into());
+        return Err("vocals.mp3 not found".into());
     }
     let out_path = dir.join("pitch.json");
     if out_path.exists() {
@@ -37,7 +37,7 @@ pub async fn precompute_reference_pitch(dir: &Path) -> Result<(), String> {
     }
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let (samples, sr) = load_wav_mono(&dir.join("vocals.wav"))?;
+        let (samples, sr) = load_wav_mono(&dir.join("vocals.mp3"))?;
         let points = analyze_contour(&samples, sr);
         let json = serde_json::to_string(&points).map_err(|e| e.to_string())?;
         std::fs::write(dir.join("pitch.json"), json).map_err(|e| e.to_string())?;

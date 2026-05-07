@@ -128,52 +128,7 @@ fn distribute_words_in_line(
 
 #[cfg(feature = "metal")]
 fn load_wav_mono_16k(path: &Path) -> Result<AudioBuffer, String> {
-    let reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    let src_rate = spec.sample_rate;
-
-    let raw: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            reader.into_samples::<f32>().filter_map(|s| s.ok()).collect()
-        }
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample as i32;
-            let max = (1i64 << (bits - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max)
-                .collect()
-        }
-    };
-
-    let mono: Vec<f32> = if channels <= 1 {
-        raw
-    } else {
-        raw.chunks(channels)
-            .map(|c| c.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
-
-    let samples = if src_rate == 16_000 {
-        mono
-    } else {
-        use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 128,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let ratio = 16_000.0 / src_rate as f64;
-        let mut resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, mono.len(), 1)
-            .map_err(|e| e.to_string())?;
-        let out = resampler.process(&[mono], None).map_err(|e| e.to_string())?;
-        out.into_iter().next().ok_or("resample produced no output")?
-    };
-
+    let samples = crate::audio::load_wav_mono_16k(path)?;
     Ok(AudioBuffer { samples, sample_rate: 16_000 })
 }
 
@@ -273,7 +228,7 @@ async fn try_phrase_forced_alignment(
     model: WhisperModel,
     on_progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Option<Vec<WordEntry>> {
-    let vocals_path = dir.join("vocals.wav");
+    let vocals_path = dir.join("vocals.mp3");
     if !vocals_path.exists() {
         return None;
     }
@@ -583,7 +538,7 @@ async fn try_free_transcribe_alignment(
     model: WhisperModel,
     on_progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Option<Vec<WordEntry>> {
-    let vocals_path = dir.join("vocals.wav");
+    let vocals_path = dir.join("vocals.mp3");
     if !vocals_path.exists() {
         return None;
     }

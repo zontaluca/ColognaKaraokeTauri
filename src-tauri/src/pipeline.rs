@@ -196,7 +196,7 @@ where
 }
 
 /// Re-run the processing pipeline for an already-downloaded song.
-/// Skips download and vocal separation if vocals.wav already exists.
+/// Skips download and vocal separation if vocals.mp3 already exists.
 /// Always re-fetches lyrics and re-runs alignment (deletes words.json first).
 pub async fn run_reprocess<F>(
     app: AppHandle,
@@ -227,8 +227,8 @@ where
     let album_meta = fetch_album_meta(&song_title, &song_artist, &dir).await;
     on_progress(2, "done", if album_meta.cover_path.is_some() { "Cover downloaded" } else { "No cover (continuing)" }, 0.22);
 
-    // Step 3 — separate vocals (skip if vocals.wav already exists)
-    if !dir.join("vocals.wav").exists() {
+    // Step 3 — separate vocals (skip if vocals.mp3 already exists)
+    if !dir.join("vocals.mp3").exists() {
         let original = dir.join("original.mp3");
         if !original.exists() {
             return Err("original.mp3 not found — cannot re-process without re-downloading".into());

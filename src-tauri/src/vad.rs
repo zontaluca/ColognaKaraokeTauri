@@ -143,9 +143,9 @@ pub fn load_or_compute(dir: &Path) -> Result<VocalIntervals, String> {
     if let Some(iv) = load_from_disk(dir) {
         return Ok(iv);
     }
-    let vocals = dir.join("vocals.wav");
+    let vocals = dir.join("vocals.mp3");
     if !vocals.exists() {
-        return Err("vocals.wav not found".into());
+        return Err("vocals.mp3 not found".into());
     }
     let iv = detect_vocals(&vocals)?;
     save_to_disk(&iv, dir)?;

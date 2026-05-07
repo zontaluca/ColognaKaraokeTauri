@@ -36,6 +36,7 @@ crc32fast = "1"
 base64 = "0.22"
 parking_lot = "0.12"
 symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
+mp3lame-encoder = "0.2"
 
 aligner-pipeline = { path = "../crates/aligner-pipeline" }
 aligner-whisper = { path = "../crates/aligner-whisper" }
