@@ -88,6 +88,8 @@ pub fn run() {
             leaderboard::leaderboard_insert,
             leaderboard::leaderboard_top,
             leaderboard::leaderboard_global_top,
+            leaderboard::leaderboard_reset,
+            leaderboard::leaderboard_reset_song,
             open_presentation_window,
             close_presentation_window,
             is_presentation_open,

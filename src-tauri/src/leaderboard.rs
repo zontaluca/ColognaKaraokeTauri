@@ -138,3 +138,21 @@ pub fn leaderboard_global_top(
     }
     Ok(out)
 }
+
+#[tauri::command]
+pub fn leaderboard_reset(db: State<'_, DbState>) -> Result<u64, String> {
+    let conn = db.lock();
+    let n = conn
+        .execute("DELETE FROM scores", [])
+        .map_err(|e| e.to_string())?;
+    Ok(n as u64)
+}
+
+#[tauri::command]
+pub fn leaderboard_reset_song(song_dir: String, db: State<'_, DbState>) -> Result<u64, String> {
+    let conn = db.lock();
+    let n = conn
+        .execute("DELETE FROM scores WHERE song_dir = ?1", params![song_dir])
+        .map_err(|e| e.to_string())?;
+    Ok(n as u64)
+}

@@ -116,25 +116,45 @@ export default function Leaderboard({ songs }) {
   const [selected, setSelected] = useState(null);
   const [songTop, setSongTop] = useState([]);
   const [globalTop, setGlobalTop] = useState([]);
+  const [resetting, setResetting] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const g = await invoke("leaderboard_global_top", { limit: 20 });
-        setGlobalTop(Array.isArray(g) ? g : []);
-      } catch (e) { console.error(e); }
-    })();
-  }, []);
+  const loadGlobal = async () => {
+    try {
+      const g = await invoke("leaderboard_global_top", { limit: 20 });
+      setGlobalTop(Array.isArray(g) ? g : []);
+    } catch (e) { console.error(e); }
+  };
+
+  const loadSong = async (song) => {
+    try {
+      const t = await invoke("leaderboard_top", { songDir: song._dir, limit: 10 });
+      setSongTop(Array.isArray(t) ? t : []);
+    } catch (e) { console.error(e); }
+  };
+
+  useEffect(() => { loadGlobal(); }, []);
 
   useEffect(() => {
     if (!selected) { setSongTop([]); return; }
-    (async () => {
-      try {
-        const t = await invoke("leaderboard_top", { songDir: selected._dir, limit: 10 });
-        setSongTop(Array.isArray(t) ? t : []);
-      } catch (e) { console.error(e); }
-    })();
+    loadSong(selected);
   }, [selected]);
+
+  const handleReset = async () => {
+    const label = selected ? `"${selected.title}"` : "tutta la classifica";
+    if (!window.confirm(`Cancellare ${label}? Azione irreversibile.`)) return;
+    setResetting(true);
+    try {
+      if (selected) {
+        await invoke("leaderboard_reset_song", { songDir: selected._dir });
+        await loadSong(selected);
+        await loadGlobal();
+      } else {
+        await invoke("leaderboard_reset");
+        await loadGlobal();
+      }
+    } catch (e) { console.error(e); }
+    setResetting(false);
+  };
 
   const songList = useMemo(
     () => (songs || []).slice().sort((a, b) => (a.title || "").localeCompare(b.title || "")),
@@ -214,6 +234,24 @@ export default function Leaderboard({ songs }) {
             <span style={{ fontSize: 11, padding: "3px 8px", borderRadius: 999, background: "rgba(34,211,164,0.12)", color: "#22D3A4", fontWeight: 700, letterSpacing: 0.4 }}>
               {entries.length} entries
             </span>
+            <div style={{ flex: 1 }}/>
+            {entries.length > 0 && (
+              <button
+                onClick={handleReset}
+                disabled={resetting}
+                style={{
+                  all: "unset", cursor: resetting ? "default" : "pointer",
+                  padding: "6px 14px", borderRadius: 8,
+                  background: "rgba(242,61,109,0.12)",
+                  border: "1px solid rgba(242,61,109,0.25)",
+                  color: resetting ? "rgba(242,61,109,0.4)" : "#F23D6D",
+                  fontSize: 12, fontWeight: 700, letterSpacing: 0.4,
+                  transition: "all 140ms",
+                }}
+              >
+                Azzera
+              </button>
+            )}
           </div>
           {/* Column headers */}
           <div style={{
