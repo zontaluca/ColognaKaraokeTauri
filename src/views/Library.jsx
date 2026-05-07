@@ -371,7 +371,7 @@ function letterKey(title) {
 export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong, onReprocess }) {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("all");
-  const [viewMode, setViewMode] = useState("grid");
+  const [viewMode, setViewMode] = useState("list");
 
   const filtered = useMemo(() => {
     let list = songs;
