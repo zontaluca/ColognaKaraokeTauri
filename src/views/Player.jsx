@@ -266,6 +266,18 @@ export default function Player({ song }) {
     activeLineRef.current.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [currentIdx]);
 
+  // Keep pitch analyzer in sync with actual audio position
+  useEffect(() => {
+    if (!challenge || !sessionId) return;
+    const a = audioRef.current;
+    if (!a) return;
+    const onTimeUpdate = () => {
+      invoke("pitch_sync", { elapsedMs: Math.round(a.currentTime * 1000) }).catch(() => {});
+    };
+    a.addEventListener("timeupdate", onTimeUpdate);
+    return () => a.removeEventListener("timeupdate", onTimeUpdate);
+  }, [challenge, sessionId]);
+
   useEffect(() => {
     if (!challenge) return;
     let unlisten;
@@ -381,6 +393,7 @@ export default function Player({ song }) {
       setSessionId(null); return;
     }
     setAskName(false);
+    if (audioRef.current) audioRef.current.currentTime = 0;
     try { await audioRef.current?.play(); setPlaying(true); } catch (e) { console.error(e); }
   };
 

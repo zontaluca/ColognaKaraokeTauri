@@ -80,13 +80,25 @@ export default function Settings() {
   const [error, setError] = useState(null);
   const [whisperModel, setWhisperModel] = useState(null);
   const [alignmentMode, setAlignmentMode] = useState("forced_per_phrase");
+  const [micDevices, setMicDevices] = useState([]);
+  const [micDevice, setMicDevice] = useState(null); // null = system default
 
   useEffect(() => {
     invoke("get_cookie_browser").then(setCookieBrowser).catch(console.error);
     invoke("get_cookies_file").then(setCookiesFile).catch(console.error);
     invoke("get_whisper_model").then(setWhisperModel).catch(console.error);
     invoke("get_alignment_mode").then(setAlignmentMode).catch(console.error);
+    invoke("list_mic_devices").then(setMicDevices).catch(console.error);
+    invoke("get_mic_device").then(setMicDevice).catch(console.error);
   }, []);
+
+  async function selectMicDevice(name) {
+    setSaving(true); setError(null);
+    try {
+      await invoke("set_mic_device", { name });
+      setMicDevice(name);
+    } catch (e) { setError(String(e)); } finally { setSaving(false); }
+  }
 
   const gpuDisabled = whisperModel === "disabled";
 
@@ -197,6 +209,33 @@ export default function Settings() {
                 disabled={saving}
                 onChange={() => selectAlignmentMode(val)}
                 last={i === arr.length - 1}
+              />
+            ))}
+          </>
+        )}
+      </SettingGroup>
+
+      {/* Mic selection */}
+      <SettingGroup title="Microfono">
+        {micDevices.length === 0 ? (
+          <SettingRow label="Nessun microfono rilevato" hint="Controlla i permessi microfono nelle Impostazioni di sistema." last control={null} />
+        ) : (
+          <>
+            <RadioCard
+              label="Default di sistema"
+              desc="Usa il microfono predefinito di macOS."
+              checked={micDevice === null}
+              disabled={saving}
+              onChange={() => selectMicDevice(null)}
+            />
+            {micDevices.map((name, i) => (
+              <RadioCard
+                key={name}
+                label={name}
+                checked={micDevice === name}
+                disabled={saving}
+                onChange={() => selectMicDevice(name)}
+                last={i === micDevices.length - 1}
               />
             ))}
           </>

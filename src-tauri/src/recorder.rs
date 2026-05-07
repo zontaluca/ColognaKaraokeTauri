@@ -7,6 +7,14 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 use tauri::{AppHandle, Manager, State};
 
+#[tauri::command]
+pub fn list_mic_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    host.input_devices()
+        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
 /// Shared live audio ring buffer consumed by pitch analyzer.
 #[derive(Default)]
 pub struct MicBuffer {
@@ -21,6 +29,7 @@ pub enum RecCmd {
     Start {
         song_dir: String,
         session_id: String,
+        device_name: Option<String>,
         resp: Sender<Result<String, String>>,
     },
     Stop {
@@ -55,12 +64,12 @@ fn recorder_thread(buf: MicBufferState, tx_slot: RecorderTx) {
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            RecCmd::Start { song_dir, session_id, resp } => {
+            RecCmd::Start { song_dir, session_id, device_name, resp } => {
                 if active.is_some() {
                     let _ = resp.send(Err("Recorder already running".into()));
                     continue;
                 }
-                match start_stream(&buf, &song_dir, &session_id) {
+                match start_stream(&buf, &song_dir, &session_id, device_name.as_deref()) {
                     Ok((stream, writer, path)) => {
                         let p = path.to_string_lossy().into_owned();
                         active = Some((stream, writer, path));
@@ -90,13 +99,21 @@ fn start_stream(
     buf: &MicBufferState,
     song_dir: &str,
     session_id: &str,
+    device_name: Option<&str>,
 ) -> Result<(
     cpal::Stream,
     Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
     PathBuf,
 ), String> {
     let host = cpal::default_host();
-    let device = host.default_input_device().ok_or("No default mic")?;
+    let device = match device_name {
+        Some(name) => host
+            .input_devices()
+            .map_err(|e| e.to_string())?
+            .find(|d| d.name().as_deref().ok() == Some(name))
+            .ok_or_else(|| format!("Mic device '{}' not found", name))?,
+        None => host.default_input_device().ok_or("No default mic")?,
+    };
     let config = device.default_input_config().map_err(|e| e.to_string())?;
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
@@ -204,13 +221,27 @@ fn send_cmd(tx_slot: &RecorderTx, cmd: RecCmd) -> Result<(), String> {
 
 #[tauri::command]
 pub fn recorder_start(
+    app: AppHandle,
     song_dir: String,
     session_id: String,
     tx: State<'_, RecorderTx>,
 ) -> Result<String, String> {
+    let device_name = crate::settings::load_settings(&app).mic_device;
     let (resp, rx) = mpsc::channel();
-    send_cmd(tx.inner(), RecCmd::Start { song_dir, session_id, resp })?;
+    send_cmd(tx.inner(), RecCmd::Start { song_dir, session_id, device_name, resp })?;
     rx.recv().map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn get_mic_device(app: AppHandle) -> Option<String> {
+    crate::settings::load_settings(&app).mic_device
+}
+
+#[tauri::command]
+pub fn set_mic_device(app: AppHandle, name: Option<String>) -> Result<(), String> {
+    let mut settings = crate::settings::load_settings(&app);
+    settings.mic_device = name;
+    crate::settings::save_settings(&app, &settings)
 }
 
 #[tauri::command]

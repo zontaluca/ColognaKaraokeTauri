@@ -110,6 +110,9 @@ pub struct AppSettings {
     pub alignment_mode: AlignmentMode,
     #[serde(default)]
     pub whisper_model: WhisperModelChoice,
+    /// Preferred microphone device name; None = system default
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_device: Option<String>,
 }
 
 fn settings_path(app: &AppHandle) -> PathBuf {

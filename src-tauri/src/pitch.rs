@@ -94,14 +94,18 @@ pub async fn pitch_start(
     // Load reference pitch + words
     let dir = std::path::PathBuf::from(&song_dir);
     let pitch_json = dir.join("pitch.json");
-    let reference: Vec<PitchPoint> = if pitch_json.exists() {
+    if !pitch_json.exists() {
+        return Err("pitch.json not found — elabora la canzone prima di usare il challenge".into());
+    }
+    let reference: Vec<PitchPoint> = {
         let s = std::fs::read_to_string(&pitch_json).map_err(|e| e.to_string())?;
         serde_json::from_str(&s).map_err(|e| e.to_string())?
-    } else {
-        Vec::new()
     };
     let words_json = dir.join("words.json");
-    let word_boundaries: Vec<(u64, u64)> = if words_json.exists() {
+    if !words_json.exists() {
+        return Err("words.json not found — allineamento parole non disponibile per questa canzone".into());
+    }
+    let word_boundaries: Vec<(u64, u64)> = {
         let s = std::fs::read_to_string(&words_json).map_err(|e| e.to_string())?;
         let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
         v.as_array()
@@ -116,8 +120,6 @@ pub async fn pitch_start(
                     .collect()
             })
             .unwrap_or_default()
-    } else {
-        Vec::new()
     };
 
     {
@@ -140,6 +142,15 @@ pub async fn pitch_start(
 #[tauri::command]
 pub fn pitch_stop(state: State<'_, PitchState>) -> Result<(), String> {
     state.lock().active = false;
+    Ok(())
+}
+
+/// Sync the analyzer clock to actual audio playback position.
+/// Call this from JS on `timeupdate` to keep wall-clock in step with audio.currentTime.
+#[tauri::command]
+pub fn pitch_sync(state: State<'_, PitchState>, elapsed_ms: u64) -> Result<(), String> {
+    let mut s = state.lock();
+    s.song_start_epoch_ms = now_ms().saturating_sub(elapsed_ms);
     Ok(())
 }
 
