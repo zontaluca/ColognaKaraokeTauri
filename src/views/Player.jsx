@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
 
@@ -96,15 +96,13 @@ function Avatar({ name }) {
   );
 }
 
-export default function Player({ song, onPlayingChange }) {
+const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, onPresentOpenChange }, ref) {
   const audioRef = useRef(null);
   const waveformRef = useRef(null);
   const rafRef = useRef(0);
   const activeLineRef = useRef(null);
   const lastSeekRef = useRef(0);
   const stageRef = useRef(null);
-  const [presentOpen, setPresentOpen] = useState(false);
-
   const [src, setSrc] = useState(null);
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -314,7 +312,7 @@ export default function Player({ song, onPlayingChange }) {
     let unlisten;
     (async () => {
       unlisten = await listen("karaoke://presentation-ready", () => {
-        setPresentOpen(true);
+        onPresentOpenChange(true);
         if (!song) return;
         emit("karaoke://presentation-init", {
           song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
@@ -329,7 +327,7 @@ export default function Player({ song, onPlayingChange }) {
   useEffect(() => {
     let unlisten;
     (async () => {
-      unlisten = await listen("karaoke://presentation-closed", () => setPresentOpen(false));
+      unlisten = await listen("karaoke://presentation-closed", () => onPresentOpenChange(false));
     })();
     return () => unlisten && unlisten();
   }, []);
@@ -340,15 +338,19 @@ export default function Player({ song, onPlayingChange }) {
   }, [currentIdx, wordIdx, wordStatuses]);
 
   const openPresentation = useCallback(async () => {
-    try { await invoke("open_presentation_window"); setPresentOpen(true); }
+    try { await invoke("open_presentation_window"); onPresentOpenChange(true); }
     catch (e) { console.error("open_presentation_window", e); }
-  }, []);
+  }, [onPresentOpenChange]);
+
+  // Expose controls to parent via ref (initialized here, updated after toggle/stop are defined below)
+  const toggleRef = useRef(null);
+  const stopRef = useRef(null);
 
   // On mount: detect if presentation window is already open (e.g. song changed while window was open)
   useEffect(() => {
     invoke("is_presentation_open").then(open => {
       if (!open) return;
-      setPresentOpen(true);
+      onPresentOpenChange(true);
       if (!song) return;
       emit("karaoke://presentation-init", {
         song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
@@ -372,6 +374,15 @@ export default function Player({ song, onPlayingChange }) {
     a.pause(); a.currentTime = 0; setPlaying(false);
     if (challenge && sessionId) endChallenge();
   };
+
+  // Update refs every render so imperative handle always calls latest version
+  toggleRef.current = toggle;
+  stopRef.current = stop;
+  useImperativeHandle(ref, () => ({
+    toggle: () => toggleRef.current?.(),
+    stop: () => stopRef.current?.(),
+    openPresentation,
+  }), [openPresentation]);
 
   const seek = (pct) => {
     const a = audioRef.current;
@@ -790,4 +801,6 @@ export default function Player({ song, onPlayingChange }) {
       )}
     </div>
   );
-}
+});
+
+export default Player;
