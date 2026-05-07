@@ -174,6 +174,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
 
   useEffect(() => {
     setWordTimestamps(null);
+    setWordSync(false);
     if (!song?._dir) return;
     invoke("get_words", { dir: song._dir })
       .then(words => { if (Array.isArray(words) && words.length > 0) setWordTimestamps(words); })
