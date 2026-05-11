@@ -120,6 +120,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   const [wordSync, setWordSync] = useState(false);
   const [lrcOffset, setLrcOffset] = useState(0);
   const [lrcOffsetInput, setLrcOffsetInput] = useState("0.00");
+  const [calibrating, setCalibrating] = useState(false);
 
   const [challenge, setChallenge] = useState(false);
   const [playerName, setPlayerName] = useState("");
@@ -239,15 +240,22 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
 
   useEffect(() => {
     if (!src) return;
+    const isCalibPending = calibrationPendingRef.current;
+    if (isCalibPending) calibrationPendingRef.current = false;
     const restore = pendingRestoreRef.current;
-    if (!restore) return;
+    if (!restore && !isCalibPending) return;
     pendingRestoreRef.current = null;
     const a = audioRef.current;
     if (!a) return;
     const onCanPlay = () => {
       a.removeEventListener("canplay", onCanPlay);
-      a.currentTime = restore.time;
-      if (restore.shouldPlay) { a.play().then(() => setPlaying(true)).catch(() => {}); }
+      if (isCalibPending) {
+        a.currentTime = 0;
+        a.play().then(() => setPlaying(true)).catch(() => {});
+      } else {
+        a.currentTime = restore.time;
+        if (restore.shouldPlay) { a.play().then(() => setPlaying(true)).catch(() => {}); }
+      }
     };
     a.addEventListener("canplay", onCanPlay);
     return () => a.removeEventListener("canplay", onCanPlay);
@@ -491,6 +499,48 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     }
   };
 
+  const calibrationPendingRef = useRef(false);
+
+  const startCalibration = useCallback(() => {
+    if (!synced || lrcLines.length === 0) return;
+    setCalibrating(true);
+    if (!preferInstrumental) {
+      const a = audioRef.current;
+      if (!a) return;
+      a.currentTime = 0;
+      a.play().then(() => setPlaying(true)).catch(() => {});
+    } else {
+      calibrationPendingRef.current = true;
+      setPreferInstrumental(false);
+    }
+  }, [synced, lrcLines, preferInstrumental]);
+
+  const cancelCalibration = useCallback(() => {
+    setCalibrating(false);
+    const a = audioRef.current;
+    if (a) { a.pause(); setPlaying(false); }
+  }, []);
+
+  useEffect(() => {
+    if (!calibrating) return;
+    const onKey = (e) => {
+      if (e.code === "Escape") { cancelCalibration(); return; }
+      if (e.code !== "Space") return;
+      e.preventDefault();
+      const a = audioRef.current;
+      if (!a || lrcLines.length === 0) return;
+      const offset = Math.round((a.currentTime - lrcLines[0].ts_ms / 1000) * 100) / 100;
+      setLrcOffset(offset);
+      setLrcOffsetInput(offset.toFixed(2));
+      if (song?._dir) invoke("set_lrc_offset", { dir: song._dir, offset }).catch(console.error);
+      setCalibrating(false);
+      a.pause();
+      setPlaying(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [calibrating, lrcLines, song, cancelCalibration]);
+
   const startChallenge = async () => {
     if (!song?._dir || !playerName.trim()) return;
     const sid = `${Date.now()}`;
@@ -577,6 +627,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
             <Toggle label="Instrumental" active={preferInstrumental} onChange={() => setPreferInstrumental(v => !v)}/>
             <Toggle label="Challenge" active={challenge} icon="🏆" disabled={playing || !!sessionId} onChange={() => setChallenge(v => !v)}/>
             {wordTimestamps && <Toggle label="Word sync (Experimental)" active={wordSync} icon="◉" onChange={() => setWordSync(v => !v)}/>}
+            {synced && <Toggle label={calibrating ? "Calibrazione ON" : "Calibrazione"} active={calibrating} icon="🎯" onChange={calibrating ? cancelCalibration : startCalibration}/>}
             <Toggle label={presentOpen ? "Presentation ON" : "Presentation"} active={presentOpen} icon="📺" onChange={openPresentation}/>
           </div>
         </div>
@@ -610,6 +661,42 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
           {/* Stage glow blobs */}
           <div style={{ position: "absolute", top: -80, left: -40, width: 260, height: 260, background: "radial-gradient(circle, rgba(255,179,112,0.15), transparent 70%)", filter: "blur(20px)", animation: "floaty 6s ease-in-out infinite", pointerEvents: "none" }}/>
           <div style={{ position: "absolute", top: -60, right: -40, width: 280, height: 280, background: "radial-gradient(circle, rgba(242,61,109,0.15), transparent 70%)", filter: "blur(20px)", animation: "floaty 8s ease-in-out infinite reverse", pointerEvents: "none" }}/>
+
+          {calibrating && (
+            <div style={{
+              position: "absolute", inset: 0, zIndex: 20,
+              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16,
+              background: "rgba(7,6,12,0.82)", backdropFilter: "blur(4px)",
+            }}>
+              <div style={{ fontSize: 44, lineHeight: 1 }}>🎯</div>
+              <div style={{
+                fontFamily: "var(--font-display)", fontSize: "clamp(20px, 4vmin, 32px)", fontWeight: 700,
+                color: "#FFF", textAlign: "center", padding: "0 32px", lineHeight: 1.3,
+              }}>
+                Premi <kbd style={{
+                  display: "inline-block", padding: "2px 10px", borderRadius: 8,
+                  background: "rgba(255,255,255,0.12)", border: "1px solid rgba(255,255,255,0.2)",
+                  fontFamily: "var(--font-mono)", fontSize: "0.85em",
+                }}>SPAZIO</kbd> sull'attacco del primo testo
+              </div>
+              {lrcLines.length > 0 && (
+                <div style={{ fontSize: 14, color: "rgba(237,233,255,0.5)", fontStyle: "italic" }}>
+                  "{lrcLines[0].text}"
+                </div>
+              )}
+              <button
+                onClick={cancelCalibration}
+                style={{
+                  all: "unset", cursor: "pointer", marginTop: 8,
+                  padding: "8px 20px", borderRadius: 10, fontSize: 12, fontWeight: 600,
+                  background: "rgba(255,255,255,0.06)", color: "rgba(237,233,255,0.6)",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                }}
+              >
+                Annulla (ESC)
+              </button>
+            </div>
+          )}
 
           {synced && countdown !== null && (
             <div style={{
