@@ -21,6 +21,7 @@ impl VocalIntervals {
         self.regions.iter().map(|(s, e)| e.saturating_sub(*s)).sum()
     }
 
+    #[allow(dead_code)]
     pub fn first_vocal_in_window(&self, start_ms: u64, end_ms: u64) -> Option<u64> {
         for (s, e) in &self.regions {
             if *e <= start_ms {

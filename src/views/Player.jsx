@@ -18,7 +18,7 @@ function parseLrc(text) {
     const mm = parseInt(m[1], 10), ss = parseInt(m[2], 10);
     const frac = m[3];
     const ms = frac.length === 2 ? parseInt(frac, 10) * 10 : parseInt(frac, 10);
-    const t = m[4].trim();
+    const t = m[4].trim().replace(/<\d{2}:\d{2}\.\d{2,3}>/g, "").trim();
     if (!t) return null;
     return { ts_ms: (mm * 60 + ss) * 1000 + ms, text: t };
   }).filter(Boolean).sort((a, b) => a.ts_ms - b.ts_ms);
@@ -101,9 +101,12 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   const waveformRef = useRef(null);
   const rafRef = useRef(0);
   const activeLineRef = useRef(null);
+  const lyricsScrollRef = useRef(null);
   const lastSeekRef = useRef(0);
   const stageRef = useRef(null);
   const presentInitRef = useRef(null);
+  const pendingRestoreRef = useRef(null);
+  const playingRef = useRef(false);
   const [src, setSrc] = useState(null);
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -190,11 +193,30 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
       .catch(() => {});
   }, [song]);
 
+  // Full reset when song changes
   useEffect(() => {
-    setSrc(null);
+    const a = audioRef.current;
+    if (a) { a.pause(); a.currentTime = 0; }
+    setPlaying(false);
     setDuration(song?.duration_sec || 0);
     setCurrentIdx(-1); setWordIdx(-1); setDisplayTime(0);
+    lastSeekRef.current = 0;
+    if (waveformRef.current) waveformRef.current.style.setProperty("--progress", "0");
     setWordStatuses({}); setFinalScore(null); setRank(null);
+    pendingRestoreRef.current = null;
+    lyricsScrollRef.current?.scrollTo({ top: 0, behavior: "instant" });
+  }, [song]);
+
+  // Save playback position before instrumental toggle (not on song change)
+  useEffect(() => {
+    const a = audioRef.current;
+    pendingRestoreRef.current = { time: a?.currentTime ?? 0, shouldPlay: playingRef.current };
+    if (a) a.pause();
+  }, [preferInstrumental]);
+
+  // Load src whenever song or preferInstrumental changes
+  useEffect(() => {
+    setSrc(null);
     if (!song?._dir) return;
     (async () => {
       try {
@@ -210,6 +232,24 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
       .then(t => setTopScores(Array.isArray(t) ? t : []))
       .catch(() => {});
   }, [song]);
+
+  useEffect(() => { playingRef.current = playing; }, [playing]);
+
+  useEffect(() => {
+    if (!src) return;
+    const restore = pendingRestoreRef.current;
+    if (!restore) return;
+    pendingRestoreRef.current = null;
+    const a = audioRef.current;
+    if (!a) return;
+    const onCanPlay = () => {
+      a.removeEventListener("canplay", onCanPlay);
+      a.currentTime = restore.time;
+      if (restore.shouldPlay) { a.play().then(() => setPlaying(true)).catch(() => {}); }
+    };
+    a.addEventListener("canplay", onCanPlay);
+    return () => a.removeEventListener("canplay", onCanPlay);
+  }, [src]);
 
   useEffect(() => { if (audioRef.current) audioRef.current.volume = volume; }, [volume]);
 
@@ -389,6 +429,10 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     const a = audioRef.current;
     if (!a) return;
     a.pause(); a.currentTime = 0; setPlaying(false);
+    setDisplayTime(0); lastSeekRef.current = 0;
+    setCurrentIdx(-1); setWordIdx(-1);
+    if (waveformRef.current) waveformRef.current.style.setProperty("--progress", "0");
+    lyricsScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     if (challenge && sessionId) endChallenge();
   };
 
@@ -406,6 +450,35 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     if (!a || !duration) return;
     a.currentTime = duration * pct;
     setDisplayTime(a.currentTime);
+    if (waveformRef.current) waveformRef.current.style.setProperty("--progress", String(pct));
+    if (synced) {
+      const tMs = a.currentTime * 1000;
+      const effectiveTMs = tMs - lrcOffset * 1000;
+      let newLine = -1;
+      for (let i = 0; i < lrcLines.length; i++) {
+        const act = lineActivations[i] ?? lrcLines[i].ts_ms;
+        if (act <= effectiveTMs) newLine = i; else break;
+      }
+      let newWord = -1;
+      if (newLine >= 0) {
+        if (effectiveWordsByLine?.[newLine]?.length > 0) {
+          const arr = effectiveWordsByLine[newLine];
+          for (let i = 0; i < arr.length; i++) {
+            if (arr[i].start_ms <= effectiveTMs) newWord = i; else break;
+          }
+        } else {
+          const line = lrcLines[newLine];
+          const words = line.text.trim().split(/\s+/);
+          const lineStart = line.ts_ms;
+          const lineEnd = lrcLines[newLine + 1]?.ts_ms ?? (lineStart + 3000);
+          const elapsed = effectiveTMs - lineStart;
+          const dur = Math.max(1, lineEnd - lineStart);
+          newWord = Math.min(Math.max(Math.floor((elapsed / dur) * words.length), 0), words.length - 1);
+        }
+      }
+      setCurrentIdx(newLine);
+      setWordIdx(newWord);
+    }
   };
 
   const startChallenge = async () => {
@@ -529,7 +602,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
           <div style={{ position: "absolute", top: -60, right: -40, width: 280, height: 280, background: "radial-gradient(circle, rgba(242,61,109,0.15), transparent 70%)", filter: "blur(20px)", animation: "floaty 8s ease-in-out infinite reverse", pointerEvents: "none" }}/>
 
           {synced ? (
-            <div style={{ flex: 1, overflowY: "auto", padding: "0 40px", scrollBehavior: "smooth", scrollbarWidth: "none" }}
+            <div ref={lyricsScrollRef} style={{ flex: 1, overflowY: "auto", padding: "0 40px", scrollBehavior: "smooth", scrollbarWidth: "none" }}
               className="lyrics-scroll">
               <div style={{ height: "40%", flexShrink: 0 }}/>
               {lrcLines.map((line, i) => {

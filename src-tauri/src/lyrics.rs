@@ -130,6 +130,7 @@ pub async fn fetch_lyrics(title: &str, artist: &str, duration_sec: Option<u64>) 
 
 /// Shift all LRC timestamps by `offset_ms` milliseconds (can be negative).
 /// Lines without timestamps are passed through unchanged.
+#[allow(dead_code)]
 pub fn shift_lrc(lrc: &str, offset_ms: i64) -> String {
     lrc.lines()
         .map(|line| {

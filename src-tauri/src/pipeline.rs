@@ -24,6 +24,7 @@ pub struct StageUpdate {
 /// Stage indices:
 /// 0 = Download, 1 = Lyrics, 2 = Album art, 3 = Separate vocals,
 /// 4 = Align words, 5 = Pitch contour, 6 = Save
+#[allow(dead_code)]
 pub const STAGES: &[&str] = &[
     "Download audio",
     "Fetch lyrics",

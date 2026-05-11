@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use base64::Engine;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, WriteBytesExt};
 use chfft::RFft1D;
 use crc32fast::Hasher as Crc32Hasher;
 use once_cell::sync::Lazy;
