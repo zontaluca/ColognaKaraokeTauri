@@ -62,6 +62,7 @@ pub fn run() {
             library::delete_song,
             library::get_library_dir,
             library::get_song_audio_path,
+            library::set_lrc_offset,
             lyrics::fetch_lyrics_cmd,
             lyrics::parse_lrc_cmd,
             pipeline::process_youtube_url,

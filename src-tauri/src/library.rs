@@ -78,6 +78,7 @@ pub fn scan_library(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
                         serde_json::Value::String(cover.to_string_lossy().into_owned()),
                     );
                 }
+                obj.entry("lrc_offset_sec").or_insert(serde_json::json!(0.0));
                 // Cloud sync fields — defaults for songs that predate the feature
                 obj.entry("cloud_synced").or_insert(false.into());
                 obj.entry("local_deleted").or_insert(false.into());
@@ -107,6 +108,20 @@ pub fn delete_song(dir: String) -> Result<(), String> {
 #[tauri::command]
 pub fn get_library_dir(app: AppHandle) -> Result<String, String> {
     Ok(library_dir(&app).to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn set_lrc_offset(dir: String, offset: f64) -> Result<(), String> {
+    let p = PathBuf::from(&dir);
+    let meta_path = p.join("metadata.json");
+    let s = fs::read_to_string(&meta_path).map_err(|e| e.to_string())?;
+    let mut meta: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("lrc_offset_sec".to_string(), serde_json::json!(offset));
+    }
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+    fs::write(meta_path, json).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]

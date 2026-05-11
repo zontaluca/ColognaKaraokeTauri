@@ -103,6 +103,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   const activeLineRef = useRef(null);
   const lastSeekRef = useRef(0);
   const stageRef = useRef(null);
+  const presentInitRef = useRef(null);
   const [src, setSrc] = useState(null);
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -114,6 +115,8 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   const [displayTime, setDisplayTime] = useState(0);
 
   const [wordSync, setWordSync] = useState(false);
+  const [lrcOffset, setLrcOffset] = useState(0);
+  const [lrcOffsetInput, setLrcOffsetInput] = useState("0.00");
 
   const [challenge, setChallenge] = useState(false);
   const [playerName, setPlayerName] = useState("");
@@ -173,6 +176,12 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   }, [effectiveWordsByLine, lrcLines]);
 
   useEffect(() => {
+    const offset = typeof song?.lrc_offset_sec === "number" ? song.lrc_offset_sec : 0;
+    setLrcOffset(offset);
+    setLrcOffsetInput(offset.toFixed(2));
+  }, [song]);
+
+  useEffect(() => {
     setWordTimestamps(null);
     setWordSync(false);
     if (!song?._dir) return;
@@ -208,6 +217,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     const a = audioRef.current;
     if (!a) return;
     const t = a.currentTime, tMs = t * 1000;
+    const effectiveTMs = tMs - lrcOffset * 1000;
     if (waveformRef.current && duration > 0) {
       waveformRef.current.style.setProperty("--progress", String(t / duration));
     }
@@ -215,7 +225,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     if (synced) {
       for (let i = 0; i < lrcLines.length; i++) {
         const act = lineActivations[i] ?? lrcLines[i].ts_ms;
-        if (act <= tMs) newLine = i; else break;
+        if (act <= effectiveTMs) newLine = i; else break;
       }
     }
     let newWord = -1;
@@ -223,14 +233,14 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
       if (effectiveWordsByLine && effectiveWordsByLine[newLine]?.length > 0) {
         const arr = effectiveWordsByLine[newLine];
         for (let i = 0; i < arr.length; i++) {
-          if (arr[i].start_ms <= tMs) newWord = i; else break;
+          if (arr[i].start_ms <= effectiveTMs) newWord = i; else break;
         }
       } else {
         const line = lrcLines[newLine];
         const words = line.text.trim().split(/\s+/);
         const lineStart = line.ts_ms;
         const lineEnd = lrcLines[newLine + 1]?.ts_ms ?? (lineStart + 3000);
-        const elapsed = tMs - lineStart;
+        const elapsed = effectiveTMs - lineStart;
         const dur = Math.max(1, lineEnd - lineStart);
         newWord = Math.min(Math.max(Math.floor((elapsed / dur) * words.length), 0), words.length - 1);
       }
@@ -242,7 +252,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
       setDisplayTime(t);
     }
     rafRef.current = requestAnimationFrame(tick);
-  }, [synced, lrcLines, effectiveWordsByLine, lineActivations, duration]);
+  }, [synced, lrcLines, effectiveWordsByLine, lineActivations, duration, lrcOffset]);
 
   useEffect(() => {
     if (playing) { rafRef.current = requestAnimationFrame(tick); return () => cancelAnimationFrame(rafRef.current); }
@@ -299,6 +309,11 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     return () => unlisten && unlisten();
   }, [challenge]);
 
+  // Keep ref current so the presentation-ready handler always has fresh data
+  useEffect(() => {
+    presentInitRef.current = { song, lrcLines, effectiveWordsByLine, currentIdx, wordIdx, wordStatuses };
+  });
+
   // Presentation window: sync init (song + parsed lyrics) whenever song/alignment changes
   useEffect(() => {
     if (!song) return;
@@ -308,22 +323,23 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     }).catch(() => {});
   }, [song, lrcLines, effectiveWordsByLine]);
 
-  // Re-send init when the presentation window signals it is ready
+  // Re-send init when the presentation window signals it is ready (registered once — reads ref)
   useEffect(() => {
     let unlisten;
     (async () => {
       unlisten = await listen("karaoke://presentation-ready", () => {
         onPresentOpenChange(true);
-        if (!song) return;
+        const d = presentInitRef.current;
+        if (!d?.song) return;
         emit("karaoke://presentation-init", {
-          song: { title: song.title, artist: song.artist, album: song.album, cover_path: song.cover_path, _dir: song._dir },
-          lrcLines, wordsByLine: effectiveWordsByLine,
+          song: { title: d.song.title, artist: d.song.artist, album: d.song.album, cover_path: d.song.cover_path, _dir: d.song._dir },
+          lrcLines: d.lrcLines, wordsByLine: d.effectiveWordsByLine,
         }).catch(() => {});
-        emit("karaoke://presentation-tick", { currentIdx, wordIdx, wordStatuses }).catch(() => {});
+        emit("karaoke://presentation-tick", { currentIdx: d.currentIdx, wordIdx: d.wordIdx, wordStatuses: d.wordStatuses }).catch(() => {});
       });
     })();
     return () => unlisten && unlisten();
-  }, [song, lrcLines, effectiveWordsByLine, currentIdx, wordIdx, wordStatuses]);
+  }, [onPresentOpenChange]);
 
   useEffect(() => {
     let unlisten;
@@ -523,10 +539,8 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
                 const fsCurrent = "clamp(32px, 6.5vmin, 120px)";
                 const fsAdjacent = "clamp(18px, 3vmin, 56px)";
                 const fsFar = "clamp(14px, 2.3vmin, 44px)";
-                const lineWords = isCurrent && wordSync
-                  ? (effectiveWordsByLine?.[i]?.length > 0
-                    ? effectiveWordsByLine[i]
-                    : line.text.trim().split(/\s+/).map(w => ({ word: w })))
+                const lineWords = (isCurrent && effectiveWordsByLine?.[i]?.length > 0)
+                  ? effectiveWordsByLine[i]
                   : null;
                 return (
                   <div key={i} ref={isCurrent ? activeLineRef : null} style={{
@@ -718,6 +732,38 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
             style={{ flex: 1 }}
           />
         </div>
+
+        {/* LRC offset */}
+        {synced && (
+          <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+            <span style={{ fontSize: 10, fontWeight: 700, color: "rgba(237,233,255,0.4)", letterSpacing: 0.5, textTransform: "uppercase", whiteSpace: "nowrap" }}>LRC</span>
+            <input
+              type="number"
+              step="0.01"
+              min="-30"
+              max="30"
+              value={lrcOffsetInput}
+              onChange={e => setLrcOffsetInput(e.target.value)}
+              onBlur={() => {
+                const v = parseFloat(lrcOffsetInput);
+                if (isNaN(v)) { setLrcOffsetInput(lrcOffset.toFixed(2)); return; }
+                const rounded = Math.round(v * 100) / 100;
+                setLrcOffset(rounded);
+                setLrcOffsetInput(rounded.toFixed(2));
+                if (song?._dir) invoke("set_lrc_offset", { dir: song._dir, offset: rounded }).catch(console.error);
+              }}
+              onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); }}
+              style={{
+                width: 60, padding: "4px 6px", borderRadius: 8, boxSizing: "border-box",
+                background: lrcOffset !== 0 ? "rgba(255,107,90,0.15)" : "rgba(255,255,255,0.05)",
+                border: lrcOffset !== 0 ? "1px solid rgba(255,107,90,0.35)" : "1px solid rgba(255,255,255,0.1)",
+                color: lrcOffset !== 0 ? "#FF9070" : "rgba(237,233,255,0.7)",
+                fontSize: 11, fontFamily: "var(--font-mono)", outline: "none", textAlign: "center",
+              }}
+            />
+            <span style={{ fontSize: 10, color: "rgba(237,233,255,0.4)" }}>s</span>
+          </div>
+        )}
 
         {/* Mic status */}
         {sessionId && (
