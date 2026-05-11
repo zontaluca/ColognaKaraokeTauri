@@ -39,6 +39,13 @@ body {
   50% { opacity: 1; }
 }
 
+@keyframes cdPop {
+  0%   { transform: scale(1.4); opacity: 0; }
+  20%  { transform: scale(1);   opacity: 1; }
+  70%  { transform: scale(1);   opacity: 1; }
+  100% { transform: scale(0.7); opacity: 0; }
+}
+
 button {
   font-family: inherit;
   cursor: pointer;

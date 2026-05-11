@@ -131,6 +131,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   const [rank, setRank] = useState(null);
 
   const [topScores, setTopScores] = useState([]);
+  const [countdown, setCountdown] = useState(null);
 
   const lrcLines = useMemo(() => parseLrc(song?.lrc || ""), [song]);
   const synced = isSynced(song?.lrc || "");
@@ -203,6 +204,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     lastSeekRef.current = 0;
     if (waveformRef.current) waveformRef.current.style.setProperty("--progress", "0");
     setWordStatuses({}); setFinalScore(null); setRank(null);
+    setCountdown(null);
     pendingRestoreRef.current = null;
     lyricsScrollRef.current?.scrollTo({ top: 0, behavior: "instant" });
   }, [song]);
@@ -287,6 +289,14 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     }
     setCurrentIdx(prev => prev !== newLine ? newLine : prev);
     setWordIdx(prev => prev !== newWord ? newWord : prev);
+    if (synced && lrcLines.length > 0) {
+      const firstMs = lineActivations[0] ?? lrcLines[0].ts_ms;
+      const msToFirst = firstMs - effectiveTMs;
+      const cd = (firstMs >= 3000 && msToFirst > 0 && msToFirst <= 3000) ? Math.ceil(msToFirst / 1000) : null;
+      setCountdown(prev => prev !== cd ? cd : prev);
+    } else {
+      setCountdown(null);
+    }
     if (Math.abs(t - lastSeekRef.current) > 0.25) {
       lastSeekRef.current = t;
       setDisplayTime(t);
@@ -430,7 +440,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     if (!a) return;
     a.pause(); a.currentTime = 0; setPlaying(false);
     setDisplayTime(0); lastSeekRef.current = 0;
-    setCurrentIdx(-1); setWordIdx(-1);
+    setCurrentIdx(-1); setWordIdx(-1); setCountdown(null);
     if (waveformRef.current) waveformRef.current.style.setProperty("--progress", "0");
     lyricsScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     if (challenge && sessionId) endChallenge();
@@ -601,6 +611,21 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
           <div style={{ position: "absolute", top: -80, left: -40, width: 260, height: 260, background: "radial-gradient(circle, rgba(255,179,112,0.15), transparent 70%)", filter: "blur(20px)", animation: "floaty 6s ease-in-out infinite", pointerEvents: "none" }}/>
           <div style={{ position: "absolute", top: -60, right: -40, width: 280, height: 280, background: "radial-gradient(circle, rgba(242,61,109,0.15), transparent 70%)", filter: "blur(20px)", animation: "floaty 8s ease-in-out infinite reverse", pointerEvents: "none" }}/>
 
+          {synced && countdown !== null && (
+            <div style={{
+              position: "absolute", inset: 0, zIndex: 10,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              pointerEvents: "none",
+            }}>
+              <span key={countdown} style={{
+                fontFamily: "var(--font-display)", fontSize: "clamp(80px, 18vmin, 220px)",
+                fontWeight: 800, letterSpacing: "-0.04em",
+                background: "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)",
+                WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+                animation: "cdPop 0.9s ease-out forwards",
+              }}>{countdown}</span>
+            </div>
+          )}
           {synced ? (
             <div ref={lyricsScrollRef} style={{ flex: 1, overflowY: "auto", padding: "0 40px", scrollBehavior: "smooth", scrollbarWidth: "none" }}
               className="lyrics-scroll">
