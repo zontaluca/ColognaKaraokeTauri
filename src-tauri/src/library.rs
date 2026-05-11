@@ -79,6 +79,14 @@ pub fn scan_library(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
                     );
                 }
                 obj.entry("lrc_offset_sec").or_insert(serde_json::json!(0.0));
+                // Directory mtime as unix timestamp — used by frontend to sort by recency
+                if let Ok(meta_fs) = fs::metadata(&path) {
+                    if let Ok(modified) = meta_fs.modified() {
+                        if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                            obj.insert("_added_at".to_string(), serde_json::json!(dur.as_secs()));
+                        }
+                    }
+                }
                 // Cloud sync fields — defaults for songs that predate the feature
                 obj.entry("cloud_synced").or_insert(false.into());
                 obj.entry("local_deleted").or_insert(false.into());

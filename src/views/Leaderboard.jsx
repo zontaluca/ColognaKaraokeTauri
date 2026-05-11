@@ -157,7 +157,10 @@ export default function Leaderboard({ songs }) {
   };
 
   const songList = useMemo(
-    () => (songs || []).slice().sort((a, b) => (a.title || "").localeCompare(b.title || "")),
+    () => (songs || [])
+      .slice()
+      .sort((a, b) => (b._added_at || 0) - (a._added_at || 0))
+      .slice(0, 10),
     [songs]
   );
 
