@@ -96,7 +96,7 @@ function Avatar({ name }) {
   );
 }
 
-const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, onPresentOpenChange }, ref) {
+const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, onPresentOpenChange, onSongEnd, readyEntry, onConfirmNext, onStopQueue }, ref) {
   const audioRef = useRef(null);
   const waveformRef = useRef(null);
   const rafRef = useRef(0);
@@ -106,6 +106,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   const stageRef = useRef(null);
   const presentInitRef = useRef(null);
   const pendingRestoreRef = useRef(null);
+  const autoPlayRef = useRef(false);
   const playingRef = useRef(false);
   const [src, setSrc] = useState(null);
   const [playing, setPlaying] = useState(false);
@@ -243,13 +244,15 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     const isCalibPending = calibrationPendingRef.current;
     if (isCalibPending) calibrationPendingRef.current = false;
     const restore = pendingRestoreRef.current;
-    if (!restore && !isCalibPending) return;
+    const isAutoPlay = autoPlayRef.current;
+    if (!restore && !isCalibPending && !isAutoPlay) return;
+    if (isAutoPlay) autoPlayRef.current = false;
     pendingRestoreRef.current = null;
     const a = audioRef.current;
     if (!a) return;
     const onCanPlay = () => {
       a.removeEventListener("canplay", onCanPlay);
-      if (isCalibPending) {
+      if (isCalibPending || isAutoPlay) {
         a.currentTime = 0;
         a.play().then(() => setPlaying(true)).catch(() => {});
       } else {
@@ -323,7 +326,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     const a = audioRef.current;
     if (!a) return;
     const onDur = () => setDuration(a.duration || song?.duration_sec || 0);
-    const onEnd = () => { setPlaying(false); if (challenge && sessionId) endChallenge(); };
+    const onEnd = () => { setPlaying(false); if (challenge && sessionId) endChallenge(); onSongEnd?.(); };
     a.addEventListener("loadedmetadata", onDur);
     a.addEventListener("ended", onEnd);
     return () => { a.removeEventListener("loadedmetadata", onDur); a.removeEventListener("ended", onEnd); };
@@ -407,10 +410,10 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     return () => unlisten && unlisten();
   }, []);
 
-  // Stream active line/word + score statuses to the presentation window
+  // Stream active line/word + score statuses + countdown to the presentation window
   useEffect(() => {
-    emit("karaoke://presentation-tick", { currentIdx, wordIdx, wordStatuses }).catch(() => {});
-  }, [currentIdx, wordIdx, wordStatuses]);
+    emit("karaoke://presentation-tick", { currentIdx, wordIdx, wordStatuses, countdown }).catch(() => {});
+  }, [currentIdx, wordIdx, wordStatuses, countdown]);
 
   const openPresentation = useCallback(async () => {
     try { await invoke("open_presentation_window"); onPresentOpenChange(true); }
@@ -461,6 +464,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     toggle: () => toggleRef.current?.(),
     stop: () => stopRef.current?.(),
     openPresentation,
+    queuePlay: () => { autoPlayRef.current = true; },
   }), [openPresentation]);
 
   const seek = (pct) => {
@@ -599,7 +603,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     : Math.round(((scoreState.hits + 0.5 * scoreState.partials) / (scoreState.hits + scoreState.partials + scoreState.misses)) * 100);
 
   return (
-    <div style={{ padding: "20px 28px 20px", display: "flex", flexDirection: "column", gap: 14, height: "100%", boxSizing: "border-box", minHeight: 0 }}>
+    <div style={{ padding: "20px 28px 20px", display: "flex", flexDirection: "column", gap: 14, height: "100%", boxSizing: "border-box", minHeight: 0, position: "relative" }}>
       {/* Track header */}
       <div style={{
         display: "flex", gap: 16, alignItems: "center",
@@ -1029,6 +1033,60 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
             {rank && <p style={{ color: "rgba(237,233,255,0.6)", fontSize: 13, margin: "0 0 20px" }}>Rank #{rank} for this song</p>}
             <button style={{ all: "unset", cursor: "pointer", padding: "12px 28px", borderRadius: 12, fontSize: 14, fontWeight: 600, background: CK_GRADIENT, color: "#FFF", boxShadow: "0 8px 20px rgba(242,61,109,0.35)" }} onClick={() => setFinalScore(null)}>OK</button>
           </div>
+        </div>
+      )}
+
+      {/* ── Pronto! bar — shown when next player is waiting ── */}
+      {readyEntry && (
+        <div style={{
+          position: "absolute", bottom: 0, left: 0, right: 0,
+          display: "flex", alignItems: "center", gap: 14,
+          padding: "12px 24px",
+          background: "rgba(7,6,12,0.95)",
+          backdropFilter: "blur(20px)",
+          borderTop: "1px solid rgba(255,107,90,0.4)",
+          boxShadow: "0 -8px 32px rgba(242,61,109,0.15)",
+        }}>
+          {readyEntry.song?.cover_path && (
+            <div style={{
+              width: 36, height: 36, borderRadius: 8, flexShrink: 0,
+              background: `url(${convertFileSrc(readyEntry.song.cover_path)}) center/cover no-repeat`,
+              boxShadow: "0 3px 10px rgba(0,0,0,0.5)",
+            }}/>
+          )}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase", color: "#FF9070", marginBottom: 1 }}>Prossimo</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#FFF", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {readyEntry.player_name || "Player"} · {readyEntry.song?.title || "—"}
+            </div>
+          </div>
+          <button onClick={onConfirmNext} style={{
+            all: "unset", cursor: "pointer", flexShrink: 0,
+            padding: "10px 22px", borderRadius: 11,
+            background: CK_GRADIENT, color: "#FFF",
+            fontSize: 14, fontWeight: 800, letterSpacing: -0.1,
+            boxShadow: "0 6px 20px rgba(242,61,109,0.45), inset 0 1px 0 rgba(255,255,255,0.2)",
+            display: "flex", alignItems: "center", gap: 8, transition: "transform 120ms",
+          }}
+          onMouseEnter={e => e.currentTarget.style.transform = "scale(1.03)"}
+          onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"}
+          >
+            Pronto!
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M5 4l14 8-14 8V4z"/></svg>
+          </button>
+          <button onClick={onStopQueue} style={{
+            all: "unset", cursor: "pointer", flexShrink: 0,
+            width: 28, height: 28, borderRadius: 7,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            color: "rgba(237,233,255,0.3)", background: "rgba(255,255,255,0.04)",
+            transition: "all 120ms",
+          }}
+          title="Ferma coda"
+          onMouseEnter={e => { e.currentTarget.style.color = "#F23D6D"; e.currentTarget.style.background = "rgba(242,61,109,0.12)"; }}
+          onMouseLeave={e => { e.currentTarget.style.color = "rgba(237,233,255,0.3)"; e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none"><rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor"/></svg>
+          </button>
         </div>
       )}
     </div>

@@ -66,6 +66,14 @@ function NavIcon({ id, active }) {
       <path d="M6 11a6 6 0 0012 0M12 17v3M9 21h6" stroke={c} strokeWidth="1.8" strokeLinecap="round"/>
     </svg>
   );
+  if (id === "players") return (
+    <svg width={w} height={h} viewBox="0 0 24 24" fill="none">
+      <circle cx="7" cy="9" r="3" stroke={c} strokeWidth="1.8"/>
+      <circle cx="17" cy="9" r="3" stroke={c} strokeWidth="1.8"/>
+      <path d="M1 20a6 6 0 0112 0" stroke={c} strokeWidth="1.8" strokeLinecap="round"/>
+      <path d="M16 20a5 5 0 019 0" stroke={c} strokeWidth="1.8" strokeLinecap="round"/>
+    </svg>
+  );
   if (id === "leaderboard") return (
     <svg width={w} height={h} viewBox="0 0 24 24" fill="none">
       <path d="M7 4h10v5a5 5 0 01-10 0V4z" stroke={c} strokeWidth="1.8" strokeLinejoin="round"/>
@@ -84,6 +92,7 @@ function NavIcon({ id, active }) {
 const ITEMS = [
   { id: "library",     label: "Library"    },
   { id: "download",    label: "Download"   },
+  { id: "players",     label: "Song Queue" },
   { id: "player",      label: "Player"     },
   { id: "leaderboard", label: "Classifica" },
   { id: "settings",    label: "Settings"   },

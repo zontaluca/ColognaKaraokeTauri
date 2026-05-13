@@ -9,6 +9,7 @@ mod lyrics;
 mod metadata;
 mod pipeline;
 mod pitch;
+mod players;
 mod recorder;
 mod recognizer;
 mod separator;
@@ -107,6 +108,10 @@ pub fn run() {
             cloud::cloud_make_local_only,
             cloud::cloud_list_remote_songs,
             cloud::cloud_restore_song,
+            players::players_load,
+            players::players_save,
+            players::active_queue_load,
+            players::active_queue_save,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
