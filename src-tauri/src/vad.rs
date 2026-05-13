@@ -20,20 +20,6 @@ impl VocalIntervals {
     pub fn total_vocal_ms(&self) -> u64 {
         self.regions.iter().map(|(s, e)| e.saturating_sub(*s)).sum()
     }
-
-    #[allow(dead_code)]
-    pub fn first_vocal_in_window(&self, start_ms: u64, end_ms: u64) -> Option<u64> {
-        for (s, e) in &self.regions {
-            if *e <= start_ms {
-                continue;
-            }
-            if *s >= end_ms {
-                break;
-            }
-            return Some((*s).max(start_ms));
-        }
-        None
-    }
 }
 
 fn rms_dbfs(frame: &[f32]) -> f32 {

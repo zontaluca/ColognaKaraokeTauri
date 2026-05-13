@@ -3,17 +3,6 @@ import { useJobs } from "../jobsContext.jsx";
 
 const CK_GRADIENT = "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)";
 
-const STEPS = [
-  "Download audio",
-  "Fetch lyrics",
-  "Fetch album art",
-  "Separate vocals",
-  "Align words",
-  "Compute pitch",
-  "Save",
-];
-
-// Shorter labels for pipeline display
 const STAGE_LABELS = ["download", "lyrics", "art", "separate", "align", "pitch", "save"];
 
 function PipelineRow({ job }) {

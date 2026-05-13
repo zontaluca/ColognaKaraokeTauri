@@ -21,20 +21,6 @@ pub struct StageUpdate {
     pub progress: f32,
 }
 
-/// Stage indices:
-/// 0 = Download, 1 = Lyrics, 2 = Album art, 3 = Separate vocals,
-/// 4 = Align words, 5 = Pitch contour, 6 = Save
-#[allow(dead_code)]
-pub const STAGES: &[&str] = &[
-    "Download audio",
-    "Fetch lyrics",
-    "Fetch album art",
-    "Separate vocals",
-    "Align words",
-    "Compute pitch",
-    "Save",
-];
-
 /// Run full pipeline with progress callback (step, status, message, progress 0-1).
 pub async fn run_pipeline<F>(
     app: AppHandle,

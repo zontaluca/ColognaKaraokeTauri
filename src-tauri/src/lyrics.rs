@@ -128,36 +128,6 @@ pub async fn fetch_lyrics(title: &str, artist: &str, duration_sec: Option<u64>) 
     None
 }
 
-/// Shift all LRC timestamps by `offset_ms` milliseconds (can be negative).
-/// Lines without timestamps are passed through unchanged.
-#[allow(dead_code)]
-pub fn shift_lrc(lrc: &str, offset_ms: i64) -> String {
-    lrc.lines()
-        .map(|line| {
-            if let Some(caps) = TIMESTAMP_RE.captures(line) {
-                let m: u64 = caps[1].parse().unwrap_or(0);
-                let s: u64 = caps[2].parse().unwrap_or(0);
-                let centis = &caps[3];
-                let ms_frac: u64 = if centis.len() == 2 {
-                    centis.parse::<u64>().unwrap_or(0) * 10
-                } else {
-                    centis.parse::<u64>().unwrap_or(0)
-                };
-                let ts_ms = (m * 60 + s) * 1000 + ms_frac;
-                let new_ts = (ts_ms as i64 + offset_ms).max(0) as u64;
-                let nm = new_ts / 60000;
-                let ns = (new_ts % 60000) / 1000;
-                let nms = new_ts % 1000;
-                let text = caps[4].trim();
-                format!("[{:02}:{:02}.{:03}] {}", nm, ns, nms, text)
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn urlencode(s: &str) -> String {
     s.chars()
         .map(|c| {

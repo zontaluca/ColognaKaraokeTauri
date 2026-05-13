@@ -75,12 +75,6 @@ async fn run_mega(args: &[&str]) -> Result<String, String> {
 
 // ─── Connectivity helpers ────────────────────────────────────────────────────
 
-#[allow(dead_code)]
-pub fn is_megacmd_available() -> bool {
-    // File-existence check — avoids spawning the daemon just to verify availability
-    mega_exec_path().is_some()
-}
-
 pub async fn is_network_available() -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
