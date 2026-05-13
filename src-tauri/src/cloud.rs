@@ -564,6 +564,67 @@ pub async fn cloud_restore_song(app: AppHandle, safe_name: String) -> Result<(),
     Ok(())
 }
 
+/// Force re-sync a song: delete remote folder first, then re-upload all files.
+/// Ensures stale remote files are replaced even if MEGA kept old versions.
+pub async fn resync_song(app: &AppHandle, song_dir: String) -> Result<(), String> {
+    emit_cloud(
+        app,
+        CloudSyncEvent {
+            song_dir: song_dir.clone(),
+            status: "active".into(),
+            message: "Re-sync MEGA (rimozione vecchi file)...".into(),
+            progress: 0.0,
+        },
+    );
+
+    mega_login(app).await.map_err(|e| {
+        emit_cloud(app, CloudSyncEvent {
+            song_dir: song_dir.clone(),
+            status: "error".into(),
+            message: e.clone(),
+            progress: 0.0,
+        });
+        e
+    })?;
+
+    let remote_path = remote_path_for(&song_dir);
+    // Delete remote folder (ignore error — may not exist yet)
+    let _ = run_mega(&["rm", "-rf", &remote_path]).await;
+
+    // Re-create and upload
+    upload_song(app, song_dir).await
+}
+
+#[tauri::command]
+pub async fn cloud_resync_song(app: AppHandle, dir: String) -> Result<(), String> {
+    resync_song(&app, dir).await
+}
+
+#[tauri::command]
+pub async fn cloud_resync_all(app: AppHandle) -> Result<(), String> {
+    let settings = crate::settings::load_settings(&app);
+    if settings.mega.email.is_none() {
+        return Err("MEGA non configurato".into());
+    }
+
+    let lib_dir = crate::library::library_dir(&app);
+    let entries = std::fs::read_dir(&lib_dir).map_err(|e| e.to_string())?;
+    let mut errors: Vec<String> = Vec::new();
+
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() || !p.join("metadata.json").exists() {
+            continue;
+        }
+        let song_dir = p.to_string_lossy().into_owned();
+        if let Err(e) = resync_song(&app, song_dir).await {
+            errors.push(e);
+        }
+    }
+
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+}
+
 // ─── Module init ─────────────────────────────────────────────────────────────
 
 pub fn init(_app: &AppHandle) {

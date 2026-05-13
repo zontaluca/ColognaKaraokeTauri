@@ -42,58 +42,25 @@ impl CookieBrowser {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentMode {
-    ForcedPerPhrase,
-    FreeTranscribePerPhrase,
+    Wav2vec2Ctc,
 }
 
 impl Default for AlignmentMode {
     fn default() -> Self {
-        Self::ForcedPerPhrase
+        Self::Wav2vec2Ctc
     }
 }
 
 impl AlignmentMode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::ForcedPerPhrase => "forced_per_phrase",
-            Self::FreeTranscribePerPhrase => "free_transcribe_per_phrase",
+            Self::Wav2vec2Ctc => "wav2vec2_ctc",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "forced_per_phrase" => Some(Self::ForcedPerPhrase),
-            "free_transcribe_per_phrase" => Some(Self::FreeTranscribePerPhrase),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum WhisperModelChoice {
-    Medium,
-    LargeV3Turbo,
-}
-
-impl Default for WhisperModelChoice {
-    fn default() -> Self {
-        Self::LargeV3Turbo
-    }
-}
-
-impl WhisperModelChoice {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Medium => "medium",
-            Self::LargeV3Turbo => "large_v3_turbo",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "medium" => Some(Self::Medium),
-            "large_v3_turbo" => Some(Self::LargeV3Turbo),
+            "wav2vec2_ctc" => Some(Self::Wav2vec2Ctc),
             _ => None,
         }
     }
@@ -122,8 +89,6 @@ pub struct AppSettings {
     pub cookies_file: Option<String>,
     #[serde(default)]
     pub alignment_mode: AlignmentMode,
-    #[serde(default)]
-    pub whisper_model: WhisperModelChoice,
     /// Preferred microphone device name; None = system default
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mic_device: Option<String>,

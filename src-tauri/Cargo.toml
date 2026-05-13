@@ -39,10 +39,11 @@ symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
 mp3lame-encoder = "0.2"
 
 aligner-pipeline = { path = "../crates/aligner-pipeline" }
-aligner-whisper = { path = "../crates/aligner-whisper" }
+aligner-wav2vec2 = { path = "../crates/aligner-wav2vec2" }
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-# Enable Metal GPU for Whisper inference on Apple Silicon.
-metal = ["aligner-whisper/metal"]
+# Apple Silicon GPU: CoreML execution provider for wav2vec2 ONNX.
+metal = ["aligner-wav2vec2/coreml"]
+coreml = ["aligner-wav2vec2/coreml"]

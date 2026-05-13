@@ -108,8 +108,6 @@ export default function Settings() {
   const [cookiesFile, setCookiesFile] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
-  const [whisperModel, setWhisperModel] = useState(null);
-  const [alignmentMode, setAlignmentMode] = useState("forced_per_phrase");
   const [micDevices, setMicDevices] = useState([]);
   const [micDevice, setMicDevice] = useState(null); // null = system default
 
@@ -125,8 +123,6 @@ export default function Settings() {
   useEffect(() => {
     invoke("get_cookie_browser").then(setCookieBrowser).catch(console.error);
     invoke("get_cookies_file").then(setCookiesFile).catch(console.error);
-    invoke("get_whisper_model").then(setWhisperModel).catch(console.error);
-    invoke("get_alignment_mode").then(setAlignmentMode).catch(console.error);
     invoke("list_mic_devices").then(setMicDevices).catch(console.error);
     invoke("get_mic_device").then(setMicDevice).catch(console.error);
     invoke("cloud_get_settings").then((s) => {
@@ -144,20 +140,6 @@ export default function Settings() {
       await invoke("set_mic_device", { name });
       setMicDevice(name);
     } catch (e) { setError(String(e)); } finally { setSaving(false); }
-  }
-
-  const gpuDisabled = whisperModel === "disabled";
-
-  async function selectAlignmentMode(val) {
-    setSaving(true); setError(null);
-    try { await invoke("set_alignment_mode", { mode: val }); setAlignmentMode(val); }
-    catch (e) { setError(String(e)); } finally { setSaving(false); }
-  }
-
-  async function selectWhisperModel(val) {
-    setSaving(true); setError(null);
-    try { await invoke("set_whisper_model", { model: val }); setWhisperModel(val); }
-    catch (e) { setError(String(e)); } finally { setSaving(false); }
   }
 
   async function selectCookieBrowser(val) {
@@ -213,6 +195,14 @@ export default function Settings() {
     } catch (e) { setMegaMsg({ text: String(e), type: "error" }); }
   }
 
+  async function megaResyncAll() {
+    setMegaMsg({ text: "Re-sync in corso (sostituzione file)...", type: "loading" });
+    try {
+      await invoke("cloud_resync_all");
+      setMegaMsg({ text: "Re-sync completato", type: "ok" });
+    } catch (e) { setMegaMsg({ text: String(e), type: "error" }); }
+  }
+
   return (
     <div style={{ padding: "28px 36px 36px", maxWidth: 760, overflowY: "auto", height: "100%", boxSizing: "border-box" }}>
       {/* Header */}
@@ -225,76 +215,6 @@ export default function Settings() {
           Tune the app to your room and your voice.
         </div>
       </div>
-
-      {/* Word alignment */}
-      <SettingGroup title="Word alignment">
-        {gpuDisabled ? (
-          <SettingRow
-            label="Whisper model"
-            hint="GPU non disponibile — allineamento word-level disattivato. Player usa timing per linea."
-            last
-            control={
-              <span style={{
-                fontSize: 12, fontFamily: "var(--font-mono)",
-                padding: "4px 10px", borderRadius: 7,
-                background: "rgba(255,255,255,0.06)",
-                color: "rgba(237,233,255,0.75)",
-                border: "1px solid rgba(255,255,255,0.08)",
-                flexShrink: 0,
-              }}>Disabled</span>
-            }
-          />
-        ) : (
-          <>
-            <div style={{ padding: "10px 18px 4px", fontSize: 11, fontWeight: 700, letterSpacing: 1.2, color: "rgba(237,233,255,0.4)", textTransform: "uppercase" }}>
-              Modello Whisper
-            </div>
-            {[
-              {
-                val: "large_v3_turbo",
-                label: "Large V3 Turbo",
-                desc: "Più accurato. Più lento sui brani lunghi. Default raccomandato.",
-              },
-              {
-                val: "medium",
-                label: "Medium",
-                desc: "Più veloce. Accuratezza inferiore su brani con allucinazioni o lyrics non standard.",
-              },
-            ].map(({ val, label, desc }, i, arr) => (
-              <RadioCard
-                key={val} label={label} desc={desc}
-                checked={whisperModel === val}
-                disabled={saving}
-                onChange={() => selectWhisperModel(val)}
-                last={i === arr.length - 1}
-              />
-            ))}
-            <div style={{ padding: "10px 18px 4px", fontSize: 11, fontWeight: 700, letterSpacing: 1.2, color: "rgba(237,233,255,0.4)", textTransform: "uppercase" }}>
-              Algoritmo di allineamento
-            </div>
-            {[
-              {
-                val: "forced_per_phrase",
-                label: "Forced alignment",
-                desc: "Whisper allinea il testo LRC noto all'audio per frase. Veloce, richiede LRC corrispondente al cantato.",
-              },
-              {
-                val: "free_transcribe_per_phrase",
-                label: "Free transcribe + match",
-                desc: "Whisper trascrive ogni frase liberamente, fuzzy-match con LRC. Più lento ma tollera mismatch e allucinazioni.",
-              },
-            ].map(({ val, label, desc }, i, arr) => (
-              <RadioCard
-                key={val} label={label} desc={desc}
-                checked={alignmentMode === val}
-                disabled={saving}
-                onChange={() => selectAlignmentMode(val)}
-                last={i === arr.length - 1}
-              />
-            ))}
-          </>
-        )}
-      </SettingGroup>
 
       {/* Mic selection */}
       <SettingGroup title="Microfono">
@@ -391,7 +311,7 @@ export default function Settings() {
         />
         <SettingRow
           label="Auto-sync dopo processing"
-          hint="Carica su MEGA automaticamente quando la pipeline finisce"
+          hint="Carica su MEGA automaticamente quando la pipeline finisce (incluso re-processing)"
           last
           control={
             <ToggleSwitch
@@ -414,7 +334,8 @@ export default function Settings() {
           {megaStatus?.logged_in && (
             <>
               <GhostBtn onClick={megaLogout} danger>Logout</GhostBtn>
-              <GhostBtn onClick={megaSyncAll}>Sync all ora</GhostBtn>
+              <GhostBtn onClick={megaSyncAll}>Sync non sincronizzati</GhostBtn>
+              <GhostBtn onClick={megaResyncAll}>Re-sync tutto</GhostBtn>
             </>
           )}
           {megaMsg.text && (

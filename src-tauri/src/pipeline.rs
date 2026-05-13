@@ -139,7 +139,7 @@ where
         }
     };
     let words_result =
-        run_alignment(&app, &final_song_dir, lrc_for_align.as_deref(), &on_phrase).await;
+        run_alignment(&final_song_dir, lrc_for_align.as_deref(), &on_phrase).await;
     match &words_result {
         Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
         Err(e) => {
@@ -264,7 +264,7 @@ where
             cb(4, "active", &msg, progress);
         }
     };
-    let words_result = run_alignment(&app, &dir, lrc_for_align.as_deref(), &on_phrase).await;
+    let words_result = run_alignment(&dir, lrc_for_align.as_deref(), &on_phrase).await;
     match &words_result {
         Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
         Err(e) => { on_progress(4, "error", e, 0.0); return Err(e.clone()); }
@@ -304,7 +304,7 @@ pub async fn reprocess_song(
     dir: String,
 ) -> Result<serde_json::Value, String> {
     let app2 = app.clone();
-    run_reprocess(app, dir, move |step, status, message, progress| {
+    let res = run_reprocess(app.clone(), dir.clone(), move |step, status, message, progress| {
         let _ = tauri::Emitter::emit(
             &app2,
             "karaoke://reprocess-progress",
@@ -316,7 +316,21 @@ pub async fn reprocess_song(
             },
         );
     })
-    .await
+    .await?;
+
+    // Auto-resync to MEGA if configured (force-replace old files with new ones)
+    let settings = crate::settings::load_settings(&app);
+    if settings.mega.auto_sync && settings.mega.email.is_some() {
+        let app3 = app.clone();
+        let dir3 = dir.clone();
+        tauri::async_runtime::spawn(async move {
+            if crate::cloud::is_network_available().await {
+                let _ = crate::cloud::resync_song(&app3, dir3).await;
+            }
+        });
+    }
+
+    Ok(res)
 }
 
 /// Legacy direct command (kept for compat). Prefer jobs_enqueue.

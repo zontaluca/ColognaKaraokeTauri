@@ -16,16 +16,8 @@ pnpm build                        # frontend only
 pnpm tauri build                  # full desktop app
 pnpm tauri build --features metal # Apple Silicon: Metal GPU for Whisper (recommended)
 
-# Download required sidecar binaries (yt-dlp, demucs, ggml-tiny.bin ~77 MB)
+# Download required sidecar binaries (yt-dlp, demucs) + wav2vec2 ONNX models
 ./scripts/fetch-binaries.sh
-
-# Alignment regression tests (downloads Whisper Small ~500 MB on first run)
-cargo test -p aligner-whisper --test regression -- --nocapture
-# With Metal GPU (Whisper Medium):
-cargo test -p aligner-whisper --test regression --features metal -- --nocapture
-
-# Regenerate TTS test fixtures (macOS only, requires say -v Alice)
-python3 scripts/gen-test-fixtures.py
 ```
 
 No lint scripts are configured.

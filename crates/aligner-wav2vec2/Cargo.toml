@@ -1,0 +1,24 @@
+[package]
+name = "aligner-wav2vec2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aligner-pipeline = { path = "../aligner-pipeline" }
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
+ndarray = "0.17"
+hf-hub = { version = "0.5", features = ["tokio"] }
+tokio = { version = "1", features = ["fs", "rt"] }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+dirs-next = "2"
+
+[features]
+# Enable CoreML execution provider on macOS.
+coreml = ["ort/coreml"]
+# Enable CUDA execution provider on Linux/Windows w/ NVIDIA.
+cuda = ["ort/cuda"]
+# Default: CPU only. Inference uses ORT's CPU EP.
+default = []

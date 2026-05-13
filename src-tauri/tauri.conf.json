@@ -41,8 +41,7 @@
     ],
     "externalBin": [
       "binaries/yt-dlp",
-      "binaries/demucs",
-      "binaries/whisper-apr"
+      "binaries/demucs"
     ],
     "macOS": {
       "minimumSystemVersion": "10.15",

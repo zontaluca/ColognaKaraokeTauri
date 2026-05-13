@@ -75,7 +75,65 @@ chmod +x "$DEMUCS_OUT"
 echo "Binaries done."
 ls -la "$BIN_DIR"
 
+# ---- wav2vec2 ONNX models ----
+# Layout matches `aligner_wav2vec2::default_local_dir(lang)`:
+#   <cache>/cologna-karaoke/wav2vec2/<lang>/{model.onnx,vocab.json}
+#
+# Only English is hosted as pre-exported ONNX (Xenova/transformers.js). Other
+# languages must be exported locally with scripts/export-wav2vec2-onnx.py.
+case "$(uname)" in
+  Darwin) W2V_CACHE="$HOME/Library/Caches/cologna-karaoke/wav2vec2";;
+  Linux)  W2V_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cologna-karaoke/wav2vec2";;
+  *)      W2V_CACHE="$HOME/.cache/cologna-karaoke/wav2vec2";;
+esac
+
+W2V_LANGS="${W2V_LANGS:-en}"  # override with `W2V_LANGS="en it" ./scripts/fetch-binaries.sh`
+# pick "fp16" for ~half-size, "bnb4" for ~quarter (slower) — see Xenova onnx/ tree.
+W2V_VARIANT="${W2V_VARIANT:-fp32}"
+case "$W2V_VARIANT" in
+  fp32) ONNX_FILE="model.onnx";;
+  fp16) ONNX_FILE="model_fp16.onnx";;
+  bnb4) ONNX_FILE="model_bnb4.onnx";;
+  *)    echo "[w2v] unknown W2V_VARIANT=$W2V_VARIANT (fp32|fp16|bnb4)"; exit 1;;
+esac
+
+w2v_preset_repo() {
+  # Bash 3.2-compatible (macOS default) — no associative arrays.
+  case "$1" in
+    en) echo "Xenova/wav2vec2-large-xlsr-53-english";;
+    *)  echo "";;
+  esac
+}
+
+for lang in $W2V_LANGS; do
+  dest="$W2V_CACHE/$lang"
+  mkdir -p "$dest"
+  if [[ -f "$dest/model.onnx" && -f "$dest/vocab.json" ]]; then
+    echo "[w2v] $lang already present at $dest — skip"
+    continue
+  fi
+
+  repo="$(w2v_preset_repo "$lang")"
+  if [[ -z "$repo" ]]; then
+    echo "[w2v] no pre-exported ONNX for '$lang'."
+    echo "      Export locally with:"
+    echo "        pip install transformers optimum[onnxruntime] onnx torch"
+    echo "        python3 scripts/export-wav2vec2-onnx.py --langs $lang"
+    continue
+  fi
+
+  base="https://huggingface.co/$repo/resolve/main"
+  echo "[w2v] downloading $lang from $repo → $dest ($W2V_VARIANT)"
+  curl -L --fail -o "$dest/vocab.json" "$base/vocab.json" || {
+    echo "[w2v] vocab.json fetch failed"; rm -f "$dest/vocab.json"; continue;
+  }
+  if curl -L --fail -o "$dest/model.onnx" "$base/onnx/$ONNX_FILE"; then
+    echo "[w2v] $lang model.onnx fetched ($(du -h "$dest/model.onnx" | cut -f1))"
+  else
+    echo "[w2v] $lang model.onnx fetch failed from $base/onnx/$ONNX_FILE"
+    rm -f "$dest/model.onnx"
+  fi
+done
+
 echo ""
-echo "Next step: build the 'aligner' sidecar (bundles stable_whisper via PyInstaller)."
-echo "  ./scripts/build-aligner.sh"
 echo "Done."
