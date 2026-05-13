@@ -38,6 +38,7 @@ def cache_dir() -> Path:
 
 def export_one(lang: str, hf_id: str, out_dir: Path) -> None:
     from optimum.onnxruntime import ORTModelForCTC
+    from transformers import AutoTokenizer
 
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[w2v-export] {lang}: {hf_id} -> {out_dir}")
@@ -47,6 +48,7 @@ def export_one(lang: str, hf_id: str, out_dir: Path) -> None:
         shutil.rmtree(work)
     model = ORTModelForCTC.from_pretrained(hf_id, export=True)
     model.save_pretrained(work)
+    AutoTokenizer.from_pretrained(hf_id).save_pretrained(work)
 
     src_onnx = work / "model.onnx"
     if not src_onnx.exists():
@@ -59,6 +61,8 @@ def export_one(lang: str, hf_id: str, out_dir: Path) -> None:
     vocab = work / "vocab.json"
     if vocab.exists():
         shutil.move(str(vocab), str(out_dir / "vocab.json"))
+    else:
+        raise RuntimeError(f"vocab.json not found in {work} after tokenizer save")
     shutil.rmtree(work, ignore_errors=True)
     print(f"[w2v-export] {lang}: done")
 

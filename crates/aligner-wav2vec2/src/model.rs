@@ -84,7 +84,10 @@ impl OnnxSession {
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| AlignError::ModelLoad(format!("opt level: {}", e)))?;
 
-        // Best-effort EP wiring. Failures fall through to CPU.
+        // Explicitly register execution providers so ORT doesn't auto-pick whatever
+        // is compiled into the downloaded binary (on macOS this includes CoreML,
+        // which triggers "Context leak / CoreAnalytics returned false" errors and
+        // very slow first-run model compilation when the CoreML cache is cold).
         #[cfg(feature = "coreml")]
         {
             use ort::execution_providers::CoreMLExecutionProvider;
@@ -98,6 +101,15 @@ impl OnnxSession {
             builder = builder
                 .with_execution_providers([CUDAExecutionProvider::default().build()])
                 .map_err(|e| AlignError::ModelLoad(format!("cuda ep: {}", e)))?;
+        }
+        // When no accelerated EP is requested, lock explicitly to CPU so the ORT
+        // runtime cannot fall back to auto-detected platform EPs (CoreML on macOS).
+        #[cfg(not(any(feature = "coreml", feature = "cuda")))]
+        {
+            use ort::execution_providers::CPUExecutionProvider;
+            builder = builder
+                .with_execution_providers([CPUExecutionProvider::default().build()])
+                .map_err(|e| AlignError::ModelLoad(format!("cpu ep: {}", e)))?;
         }
 
         let session = builder
