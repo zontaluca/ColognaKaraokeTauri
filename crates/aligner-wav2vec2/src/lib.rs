@@ -132,6 +132,19 @@ impl Wav2vecAligner {
         lyrics: &str,
         time_offset_sec: f64,
     ) -> Result<Vec<AlignedWord>, AlignError> {
+        let emissions = self.emissions(vocals, time_offset_sec)?;
+        self.align_emissions(&emissions, lyrics, None)
+    }
+
+    /// Run the acoustic model once over `vocals` (16 kHz mono, consumed) and
+    /// keep the per-frame log-probabilities. Several texts or time windows can
+    /// then be aligned against them with [`Self::align_emissions`] without
+    /// running inference again.
+    pub fn emissions(
+        &mut self,
+        vocals: AudioBuffer,
+        time_offset_sec: f64,
+    ) -> Result<Emissions, AlignError> {
         if vocals.sample_rate != TARGET_SAMPLE_RATE {
             return Err(AlignError::BadSampleRate {
                 expected: TARGET_SAMPLE_RATE,
@@ -139,7 +152,10 @@ impl Wav2vecAligner {
             });
         }
         if vocals.samples.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Emissions {
+                log_probs: Array2::zeros((0, self.vocab.vocab_size.max(1) as usize)),
+                time_offset_sec,
+            });
         }
 
         let mut work = vocals.samples;
@@ -147,38 +163,35 @@ impl Wav2vecAligner {
         rms_normalize(&mut work, self.config.rms_target_dbfs);
 
         let logits = self.chunked_infer(&work)?;
-        let log_probs = log_softmax_rows(logits.view());
+        Ok(Emissions {
+            log_probs: log_softmax_rows(logits.view()),
+            time_offset_sec,
+        })
+    }
 
-        let target = lyrics_to_target_ids(lyrics, &self.vocab);
-        if target.words.is_empty() {
-            return Ok(Vec::new());
+    /// Align `lyrics` against precomputed emissions. With `window` =
+    /// `Some((start_sec, end_sec))` (song time) only the frames inside that
+    /// range are used, which confines the text to that part of the song.
+    pub fn align_emissions(
+        &self,
+        emissions: &Emissions,
+        lyrics: &str,
+        window: Option<(f64, f64)>,
+    ) -> Result<Vec<AlignedWord>, AlignError> {
+        let total = emissions.log_probs.shape()[0];
+        let (f0, f1) = match window {
+            None => (0, total),
+            Some((start_sec, end_sec)) => (
+                emissions.frame_at(start_sec).min(total),
+                emissions.frame_at(end_sec).min(total),
+            ),
+        };
+        if f1 <= f0 {
+            return Err(AlignError::Ctc("empty alignment window".into()));
         }
-
-        let spans = forced_align(log_probs.view(), &target.ids, self.vocab.pad_id)?;
-
-        let mut out = Vec::with_capacity(target.words.len());
-        for word in &target.words {
-            let span = aggregate_word_span(&spans, &word.token_range);
-            let start_s = time_offset_sec + (span.start as f64) * FRAME_MS / 1000.0;
-            let end_s = time_offset_sec + ((span.end + 1) as f64) * FRAME_MS / 1000.0;
-            let conf = mean_emission_prob(&log_probs, &target.ids, &word.token_range, &spans);
-            let normalised: String = word
-                .word
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '\'' || *c == '-')
-                .flat_map(|c| c.to_lowercase())
-                .collect();
-            out.push(AlignedWord {
-                word: word.word.clone(),
-                normalized: normalised,
-                start: start_s,
-                end: end_s,
-                confidence: conf,
-            });
-        }
-
-        enforce_monotonic_starts(&mut out);
-        Ok(out)
+        let view = emissions.log_probs.slice(ndarray::s![f0..f1, ..]);
+        let offset = emissions.time_offset_sec + f0 as f64 * FRAME_MS / 1000.0;
+        align_log_probs(view, lyrics, &self.vocab, offset)
     }
 
     /// Run the ONNX model over `samples` in non-overlapping chunks, then
@@ -245,6 +258,70 @@ impl Wav2vecAligner {
     }
 }
 
+/// Per-frame log-probabilities from one inference pass, plus the song time of
+/// frame 0.
+pub struct Emissions {
+    pub log_probs: Array2<f32>,
+    pub time_offset_sec: f64,
+}
+
+impl Emissions {
+    /// Number of frames.
+    pub fn frames(&self) -> usize {
+        self.log_probs.shape()[0]
+    }
+
+    /// Song time just past the last frame.
+    pub fn end_sec(&self) -> f64 {
+        self.time_offset_sec + self.frames() as f64 * FRAME_MS / 1000.0
+    }
+
+    /// Frame index covering song time `sec` (clamped at 0).
+    pub fn frame_at(&self, sec: f64) -> usize {
+        (((sec - self.time_offset_sec) * 1000.0 / FRAME_MS).max(0.0)).round() as usize
+    }
+}
+
+/// CTC-align `lyrics` against `log_probs` ([T, V] log-softmax) whose first
+/// frame sits at `time_offset_sec`. Pure function: no model involved.
+pub fn align_log_probs(
+    log_probs: ndarray::ArrayView2<f32>,
+    lyrics: &str,
+    vocab: &Vocab,
+    time_offset_sec: f64,
+) -> Result<Vec<AlignedWord>, AlignError> {
+    let target = lyrics_to_target_ids(lyrics, vocab);
+    if target.words.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let spans = forced_align(log_probs, &target.ids, vocab.pad_id)?;
+
+    let mut out = Vec::with_capacity(target.words.len());
+    for word in &target.words {
+        let span = aggregate_word_span(&spans, &word.token_range);
+        let start_s = time_offset_sec + (span.start as f64) * FRAME_MS / 1000.0;
+        let end_s = time_offset_sec + ((span.end + 1) as f64) * FRAME_MS / 1000.0;
+        let conf = mean_emission_prob(log_probs, &target.ids, &word.token_range, &spans);
+        let normalised: String = word
+            .word
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '\'' || *c == '-')
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        out.push(AlignedWord {
+            word: word.word.clone(),
+            normalized: normalised,
+            start: start_s,
+            end: end_s,
+            confidence: conf,
+        });
+    }
+
+    enforce_monotonic_starts(&mut out);
+    Ok(out)
+}
+
 fn aggregate_word_span(spans: &[TokenSpan], range: &std::ops::Range<usize>) -> TokenSpan {
     let slice = &spans[range.clone()];
     let start = slice.iter().map(|s| s.start).min().unwrap_or(0);
@@ -253,7 +330,7 @@ fn aggregate_word_span(spans: &[TokenSpan], range: &std::ops::Range<usize>) -> T
 }
 
 fn mean_emission_prob(
-    log_probs: &Array2<f32>,
+    log_probs: ndarray::ArrayView2<f32>,
     targets: &[u32],
     range: &std::ops::Range<usize>,
     spans: &[TokenSpan],
@@ -286,5 +363,45 @@ fn enforce_monotonic_starts(words: &mut [AlignedWord]) {
             w.end = w.start + 0.02;
         }
         cursor = w.start;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_vocab() -> Vocab {
+        let json = br#"{"<pad>":0,"<s>":1,"</s>":2,"<unk>":3,"|":4,"a":5,"b":6}"#;
+        Vocab::from_bytes(json).unwrap()
+    }
+
+    /// Log-probs where each frame strongly predicts one id.
+    fn peaked(frames: &[u32], vocab: usize) -> Array2<f32> {
+        let mut data = Vec::with_capacity(frames.len() * vocab);
+        for &f in frames {
+            data.extend((0..vocab).map(|i| if i as u32 == f { -0.01 } else { -8.0 }));
+        }
+        Array2::from_shape_vec((frames.len(), vocab), data).unwrap()
+    }
+
+    #[test]
+    fn aligns_words_with_time_offset_and_confidence() {
+        let vocab = fake_vocab();
+        // "a" at frames 1-2, delimiter at 3, "b" at frames 5-6 (blank = pad = 0)
+        let lp = peaked(&[0, 5, 5, 4, 0, 6, 6, 0], 7);
+        let words = align_log_probs(lp.view(), "a b", &vocab, 10.0).unwrap();
+        assert_eq!(words.len(), 2);
+        assert!((words[0].start - 10.02).abs() < 1e-9, "{}", words[0].start);
+        assert!((words[1].start - 10.10).abs() < 1e-9, "{}", words[1].start);
+        assert!(words[0].confidence > 0.9);
+    }
+
+    #[test]
+    fn window_maps_frames_to_song_time() {
+        let em = Emissions { log_probs: Array2::zeros((500, 7)), time_offset_sec: 2.0 };
+        assert_eq!(em.frame_at(2.0), 0);
+        assert_eq!(em.frame_at(3.0), 50);
+        assert_eq!(em.frame_at(0.0), 0);
+        assert!((em.end_sec() - 12.0).abs() < 1e-9);
     }
 }

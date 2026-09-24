@@ -57,8 +57,10 @@ function CloudBadge({ song }) {
 
 function LrcBadge({ song }) {
   if (!song.lrc) return null;
+  // lrc_generated: timing produced by the aligner/recognizer, not by LRCLIB.
+  const generated = Boolean(song.lrc_generated);
   return (
-    <span style={{
+    <span title={generated ? "Timing generato automaticamente" : undefined} style={{
       display: "inline-flex", padding: "3px 8px", borderRadius: 999,
       fontSize: 9.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase",
       background: song.lrc_enhanced ? CK_GRADIENT : "rgba(0,0,0,0.55)",
@@ -67,7 +69,7 @@ function LrcBadge({ song }) {
       border: song.lrc_enhanced ? "none" : "1px solid rgba(255,255,255,0.18)",
       flexShrink: 0,
     }}>
-      {song.lrc_enhanced ? "LRC Enhanced" : "LRC"}
+      {song.lrc_enhanced ? "LRC Enhanced" : "LRC"}{generated ? " · auto" : ""}
     </span>
   );
 }

@@ -15,6 +15,7 @@ mod recorder;
 mod recognizer;
 mod separator;
 mod settings;
+mod word_timing;
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 

@@ -38,12 +38,13 @@ async fn decode_vocals(dir: &Path) -> Result<Arc<AudioBuffer>, String> {
 /// decoded once and shared by both, and the pitch contour (independent of the
 /// alignment) is computed on its own thread while alignment runs.
 /// Alignment errors are fatal; pitch errors are reported and skipped.
+/// Returns the LRC generated from the word timings when `lrc` was plain text.
 async fn align_and_pitch<F>(
     dir: &Path,
     lrc: Option<&str>,
     on_progress: &mut F,
     align_start: f32,
-) -> Result<(), String>
+) -> Result<Option<String>, String>
 where
     F: FnMut(usize, &str, &str, f32) + Send + Sync + Clone + 'static,
 {
@@ -87,13 +88,16 @@ where
         }
     };
     let words_result = run_alignment(dir, lrc, vocals, &on_phrase).await;
-    match &words_result {
-        Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
-        Err(e) => {
-            on_progress(4, "error", e, 0.0);
-            return Err(e.clone());
+    let generated_lrc = match words_result {
+        Ok(out) => {
+            on_progress(4, "done", "Words aligned", 0.88);
+            out.generated_lrc
         }
-    }
+        Err(e) => {
+            on_progress(4, "error", &e, 0.0);
+            return Err(e);
+        }
+    };
 
     // Step 5 — pitch contour (non-fatal)
     on_progress(5, "active", "Computing pitch...", 0.90);
@@ -106,7 +110,29 @@ where
         Ok(_) => on_progress(5, "done", "Pitch contour cached", 0.96),
         Err(e) => on_progress(5, "done", &format!("Pitch skipped: {}", e), 0.96),
     }
-    Ok(())
+    Ok(generated_lrc)
+}
+
+/// Store the lyrics in metadata: the generated synced LRC when there is one
+/// (flagged with `lrc_generated`), otherwise the fetched text.
+fn apply_lyrics(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    fetched: Option<String>,
+    generated: Option<String>,
+) {
+    obj.remove("lrc_generated");
+    match (generated, fetched) {
+        (Some(g), _) => {
+            obj.insert("lrc".into(), g.into());
+            obj.insert("lrc_generated".into(), "alignment".into());
+        }
+        (None, Some(f)) => {
+            obj.insert("lrc".into(), f.into());
+        }
+        (None, None) => {
+            obj.remove("lrc");
+        }
+    }
 }
 
 fn apply_album_meta(obj: &mut serde_json::Map<String, serde_json::Value>, album_meta: AlbumMeta) {
@@ -209,7 +235,7 @@ where
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     // Steps 4 + 5 — align words (mandatory) + pitch contour
-    align_and_pitch(&final_song_dir, lrc.as_deref(), &mut on_progress, 0.78).await?;
+    let generated_lrc = align_and_pitch(&final_song_dir, lrc.as_deref(), &mut on_progress, 0.78).await?;
 
     // Step 6 — save metadata
     on_progress(6, "active", "Saving to library...", 0.97);
@@ -221,11 +247,7 @@ where
         "youtube_title": download.title,
         "youtube_artist": download.artist,
     });
-    if let Some(lrc_text) = lrc {
-        meta.as_object_mut()
-            .unwrap()
-            .insert("lrc".into(), serde_json::Value::String(lrc_text));
-    }
+    apply_lyrics(meta.as_object_mut().unwrap(), lrc, generated_lrc);
     apply_album_meta(meta.as_object_mut().unwrap(), album_meta);
     save_metadata(&final_song_dir, &meta)?;
 
@@ -294,17 +316,13 @@ where
     // Steps 4 + 5 — delete words.json / pitch.json, re-align + recompute pitch
     let _ = std::fs::remove_file(dir.join("words.json"));
     let _ = std::fs::remove_file(dir.join("pitch.json"));
-    align_and_pitch(&dir, lrc.as_deref(), &mut on_progress, 0.76).await?;
+    let generated_lrc = align_and_pitch(&dir, lrc.as_deref(), &mut on_progress, 0.76).await?;
 
     // Step 6 — merge and save metadata
     on_progress(6, "active", "Saving to library...", 0.97);
     let mut meta = existing_meta;
     let obj = meta.as_object_mut().unwrap();
-    if let Some(lrc_text) = lrc {
-        obj.insert("lrc".into(), lrc_text.into());
-    } else {
-        obj.remove("lrc");
-    }
+    apply_lyrics(obj, lrc, generated_lrc);
     apply_album_meta(obj, album_meta);
     save_metadata(&dir, &meta)?;
 
