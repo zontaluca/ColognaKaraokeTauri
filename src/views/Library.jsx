@@ -60,7 +60,7 @@ function LrcBadge({ song }) {
   // lrc_generated: timing produced by the aligner/recognizer, not by LRCLIB.
   const generated = Boolean(song.lrc_generated);
   return (
-    <span title={generated ? "Timing generato automaticamente" : undefined} style={{
+    <span title={generated ? (song.lrc_generated === "asr" ? "Testo trascritto automaticamente (Parakeet)" : "Timing generato automaticamente") : undefined} style={{
       display: "inline-flex", padding: "3px 8px", borderRadius: 999,
       fontSize: 9.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase",
       background: song.lrc_enhanced ? CK_GRADIENT : "rgba(0,0,0,0.55)",

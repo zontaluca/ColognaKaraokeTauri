@@ -38,13 +38,14 @@ async fn decode_vocals(dir: &Path) -> Result<Arc<AudioBuffer>, String> {
 /// decoded once and shared by both, and the pitch contour (independent of the
 /// alignment) is computed on its own thread while alignment runs.
 /// Alignment errors are fatal; pitch errors are reported and skipped.
-/// Returns the LRC generated from the word timings when `lrc` was plain text.
+/// Returns the LRC generated from the word timings (with its source) when
+/// `lrc` was plain text or missing.
 async fn align_and_pitch<F>(
     dir: &Path,
     lrc: Option<&str>,
     on_progress: &mut F,
     align_start: f32,
-) -> Result<Option<String>, String>
+) -> Result<Option<(String, &'static str)>, String>
 where
     F: FnMut(usize, &str, &str, f32) + Send + Sync + Clone + 'static,
 {
@@ -91,7 +92,8 @@ where
     let generated_lrc = match words_result {
         Ok(out) => {
             on_progress(4, "done", "Words aligned", 0.88);
-            out.generated_lrc
+            let source = out.lrc_source;
+            out.generated_lrc.map(|lrc| (lrc, source))
         }
         Err(e) => {
             on_progress(4, "error", &e, 0.0);
@@ -118,13 +120,13 @@ where
 fn apply_lyrics(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     fetched: Option<String>,
-    generated: Option<String>,
+    generated: Option<(String, &'static str)>,
 ) {
     obj.remove("lrc_generated");
     match (generated, fetched) {
-        (Some(g), _) => {
+        (Some((g, source)), _) => {
             obj.insert("lrc".into(), g.into());
-            obj.insert("lrc_generated".into(), "alignment".into());
+            obj.insert("lrc_generated".into(), source.into());
         }
         (None, Some(f)) => {
             obj.insert("lrc".into(), f.into());

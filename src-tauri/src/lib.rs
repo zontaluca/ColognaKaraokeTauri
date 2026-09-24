@@ -1,4 +1,5 @@
 mod aligner;
+mod asr;
 mod audio;
 mod cloud;
 mod downloader;

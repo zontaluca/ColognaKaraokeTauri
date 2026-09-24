@@ -49,11 +49,20 @@ CPU-heavy work (decoding, resampling, ONNX inference, CTC, MP3 encoding, pitch c
 1. Recognize song (Shazam fingerprint of the middle 12 s, best-effort) + fetch lyrics (lrclib.net)
 2. Fetch album art (iTunes API → Cover Art Archive fallback)
 3. Separate vocals (demucs sidecar); stems are mixed/encoded to `instrumental.mp3` + `vocals.mp3` in parallel
-4. Align words — wav2vec2 CTC forced alignment (`aligner-wav2vec2`, ONNX Runtime)
+4. Align words — wav2vec2 CTC forced alignment (`aligner-wav2vec2`, ONNX Runtime), see "Word timing" below
 5. Compute reference pitch (YIN) → `pitch.json`, on its own thread concurrently with step 4
 6. Save metadata.json
 
 Steps 4 and 5 share a single decode of `vocals.mp3` (`pipeline::align_and_pitch`, also used by `reprocess_song`). The loaded wav2vec2 session is cached between queued jobs and released when the queue drains (`aligner::release_model_cache`).
+
+### Word timing (step 4)
+
+- **Synced LRC**: one inference pass (`Wav2vecAligner::emissions`), whole text aligned once, then the audio/LRC offset is estimated (`word_timing::estimate_lrc_offset_ms`); when consistent, each line is re-aligned inside its offset-corrected LRC window (`align_emissions` with a window) and the better-scoring placement is kept.
+- **Plain lyrics**: aligned the same way (no windows); a synced LRC is generated from the word timings and stored in metadata with `lrc_generated: "alignment"`.
+- **No wav2vec2 model for the language** (or alignment failure): lyrics are timed from a Parakeet transcription (`asr.rs`, `word_timing::match_transcript` + `fill_missing`).
+- **No lyrics at all**: Parakeet transcribes the vocals, words are segmented into lines, and the LRC is generated (`lrc_generated: "asr"`).
+- Post-processing (`word_timing::build_entries`): line attribution, next-line clamp (offset-corrected), low-confidence runs re-timed between confident neighbours. words.json entries carry `score` (CTC confidence) and `estimated` when interpolated.
+- Parakeet TDT 0.6B v3 runs through `parakeet-rs` (needs `ort` 2.0.0-rc.13 / ONNX Runtime 1.28, `api-28`). Model in `<cache>/cologna-karaoke/parakeet-tdt-0.6b-v3/` (INT8 by default via `scripts/fetch-binaries.sh`, `PARAKEET_VARIANT=int8|fp32|none`). Audio is split into ≤ 90 s chunks at quiet points; timestamps have 80 ms granularity. The loaded model is cached with the wav2vec2 one and released when the job queue drains.
 
 Per-song files: `metadata.json`, `original.mp3`, `instrumental.mp3`, `vocals.mp3`, `words.json`, `pitch.json`, `cover.jpg`, `recordings/`. Cloud sync (`cloud.rs` `SYNC_FILES`) must list every artifact needed to use a song after restore.
 
@@ -64,6 +73,8 @@ Per-song files: `metadata.json`, `original.mp3`, `instrumental.mp3`, `vocals.mp3
 | `jobs.rs` | Async job queue; emits `karaoke://jobs` and `karaoke://jobs-list` events |
 | `pipeline.rs` | Orchestrates all 7 pipeline stages; progress callbacks |
 | `library.rs` | Scan library dir, read/write metadata.json per song |
+| `word_timing.rs` | Pure word-timing logic: lyrics parsing, LRC offset/windows, words.json entries, LRC generation, transcript matching |
+| `asr.rs` | Parakeet TDT v3 transcription (ONNX via `parakeet-rs`), chunking, model cache |
 | `audio.rs` | Symphonia decode to mono f32 (full track or middle excerpt) + rubato resampling |
 | `http.rs` | Shared `reqwest::Client` + `urlencode` (use it instead of building clients) |
 | `downloader.rs` | yt-dlp wrapper |
@@ -94,7 +105,7 @@ Per-song files: `metadata.json`, `original.mp3`, `instrumental.mp3`, `vocals.mp3
 - `ctc.rs` — Viterbi forced alignment over the blank-extended target (two rolling alpha rows + u8 backpointers).
 - `lib.rs` — `Wav2vecAligner`: 20 s non-overlapping inference chunks, CTC, char spans → word spans; `align_owned` avoids copying the input.
 
-**Language**: picked per song by stopword counting on the LRC (`detect_lrc_language`, default `it`); the matching model directory must exist or alignment writes an empty `words.json`.
+**Language**: picked per song by stopword counting on the lyrics (`detect_lrc_language`, default `it`); when the matching wav2vec2 model directory is missing, alignment falls back to Parakeet (if installed), otherwise writes an empty `words.json`.
 
 ### Frontend views
 

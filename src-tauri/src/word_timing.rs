@@ -66,6 +66,8 @@ pub struct TimedWord {
     pub end: f64,
     /// Engine confidence in [0, 1] when available (CTC mean emission prob).
     pub confidence: Option<f32>,
+    /// Timing interpolated rather than measured.
+    pub estimated: bool,
 }
 
 /// One words.json entry.
@@ -161,6 +163,17 @@ pub fn line_windows(lines: &[LyricLine], offset_ms: i64, end_sec: f64) -> Vec<Op
         .collect()
 }
 
+/// Lines with their timestamps moved by `offset_ms` (audio minus LRC).
+pub fn shift_lines(lines: &[LyricLine], offset_ms: i64) -> Vec<LyricLine> {
+    lines
+        .iter()
+        .map(|l| LyricLine {
+            text: l.text.clone(),
+            ts_ms: l.ts_ms.map(|ts| (ts as i64 + offset_ms).max(0) as u64),
+        })
+        .collect()
+}
+
 /// Mean confidence of a group of words (0 when unknown).
 pub fn mean_confidence(words: &[TimedWord]) -> f32 {
     let vals: Vec<f32> = words.iter().filter_map(|w| w.confidence).collect();
@@ -219,7 +232,7 @@ pub fn build_entries(
                 end_ms,
                 line: Some(line_idx),
                 score: w.confidence,
-                estimated: false,
+                estimated: w.estimated,
             });
         }
         if let Some(threshold) = low_threshold {
@@ -349,12 +362,241 @@ pub fn format_lrc_timestamp(ms: u64) -> String {
     format!("[{:02}:{:02}.{:02}]", centis / 6000, (centis / 100) % 60, centis % 100)
 }
 
+// ─── Transcription (Parakeet) helpers ────────────────────────────────────────
+
+/// Pause that starts a new line when segmenting a transcription.
+const LINE_BREAK_GAP_SEC: f64 = 0.8;
+const MAX_WORDS_PER_LINE: usize = 10;
+/// A comma ends the line once it already holds this many words.
+const COMMA_BREAK_MIN_WORDS: usize = 6;
+
+/// Group transcribed words into lyric lines: break on pauses, sentence
+/// punctuation, long lines, or a comma in an already long line.
+pub fn segment_lines(words: Vec<TimedWord>) -> Vec<Vec<TimedWord>> {
+    let mut lines: Vec<Vec<TimedWord>> = Vec::new();
+    let mut current: Vec<TimedWord> = Vec::new();
+    for w in words {
+        if let Some(prev) = current.last() {
+            let gap = w.start - prev.end;
+            let ends_sentence = prev.word.ends_with(['.', '?', '!', ';', ':']);
+            let ends_clause = prev.word.ends_with(',') && current.len() >= COMMA_BREAK_MIN_WORDS;
+            if gap >= LINE_BREAK_GAP_SEC || ends_sentence || ends_clause || current.len() >= MAX_WORDS_PER_LINE {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(w);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Lyric lines for a transcription segmented with [`segment_lines`]: text is
+/// the words as recognized (punctuation kept), timestamp the first word.
+pub fn lines_from_segments(segments: &[Vec<TimedWord>]) -> Vec<LyricLine> {
+    segments
+        .iter()
+        .map(|seg| LyricLine {
+            text: seg.iter().map(|w| w.word.as_str()).collect::<Vec<_>>().join(" "),
+            ts_ms: seg.first().map(|w| (w.start * 1000.0).round().max(0.0) as u64),
+        })
+        .collect()
+}
+
+fn normalize_for_match(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Lyric words used when timing lyrics from a transcription: whitespace tokens
+/// with at least one letter or digit.
+pub fn lyric_words(line: &str) -> Vec<&str> {
+    line.split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .collect()
+}
+
+/// Normalized edit similarity in [0, 1].
+fn similarity(a: &str, b: &str) -> f32 {
+    if a == b {
+        return 1.0;
+    }
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    1.0 - prev[b.len()] as f32 / a.len().max(b.len()) as f32
+}
+
+/// Recognized words must be at least this similar to a lyric word to lend it
+/// their timing.
+const MIN_MATCH_SIMILARITY: f32 = 0.6;
+
+/// Time the lyrics from a transcription: an order-preserving alignment (a
+/// similarity-weighted longest common subsequence) pairs lyric words with
+/// recognized words; paired lyric words take the recognized timing, the rest
+/// are `None` (see [`fill_missing`]).
+pub fn match_transcript(lines: &[LyricLine], asr: &[TimedWord]) -> Vec<Vec<Option<TimedWord>>> {
+    let lyric: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(i, l)| lyric_words(&l.text).into_iter().map(move |w| (i, w)))
+        .collect();
+    let lyric_norm: Vec<String> = lyric.iter().map(|(_, w)| normalize_for_match(w)).collect();
+    let asr_norm: Vec<String> = asr.iter().map(|w| normalize_for_match(&w.word)).collect();
+
+    let (n, m) = (lyric.len(), asr.len());
+    // dp[i][j]: best total similarity pairing lyric[..i] with asr[..j].
+    let mut dp = vec![0f32; (n + 1) * (m + 1)];
+    let idx = |i: usize, j: usize| i * (m + 1) + j;
+    for i in 1..=n {
+        for j in 1..=m {
+            let mut best = dp[idx(i - 1, j)].max(dp[idx(i, j - 1)]);
+            let sim = similarity(&lyric_norm[i - 1], &asr_norm[j - 1]);
+            if sim >= MIN_MATCH_SIMILARITY {
+                best = best.max(dp[idx(i - 1, j - 1)] + sim);
+            }
+            dp[idx(i, j)] = best;
+        }
+    }
+
+    let mut timing: Vec<Option<TimedWord>> = vec![None; n];
+    let (mut i, mut j) = (n, m);
+    while i > 0 && j > 0 {
+        let here = dp[idx(i, j)];
+        let sim = similarity(&lyric_norm[i - 1], &asr_norm[j - 1]);
+        if sim >= MIN_MATCH_SIMILARITY && (here - (dp[idx(i - 1, j - 1)] + sim)).abs() < 1e-6 {
+            let a = &asr[j - 1];
+            timing[i - 1] = Some(TimedWord {
+                word: lyric[i - 1].1.to_string(),
+                start: a.start,
+                end: a.end,
+                confidence: None,
+                estimated: false,
+            });
+            i -= 1;
+            j -= 1;
+        } else if (here - dp[idx(i - 1, j)]).abs() < 1e-6 {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+
+    let mut out: Vec<Vec<Option<TimedWord>>> = vec![Vec::new(); lines.len()];
+    for ((line, _), t) in lyric.iter().zip(timing) {
+        out[*line].push(t);
+    }
+    out
+}
+
+fn lyric_word_texts(lines: &[LyricLine]) -> Vec<Vec<String>> {
+    lines.iter().map(|l| lyric_words(&l.text).into_iter().map(String::from).collect()).collect()
+}
+
+/// Typical duration given to a word placed without any timing evidence.
+const DEFAULT_WORD_SEC: f64 = 0.35;
+/// Longest duration an interpolated word may take: across a long gap the
+/// words stick to the side of the phrase they belong to instead of spreading.
+const MAX_ESTIMATED_WORD_SEC: f64 = 0.6;
+
+/// Give every unmatched lyric word a timing, interpolated between the nearest
+/// timed words and bounded by the LRC line timestamps when present. Returns
+/// per-line timed words (interpolated ones flagged `estimated`).
+pub fn fill_missing(lines: &[LyricLine], matched: Vec<Vec<Option<TimedWord>>>) -> Vec<Vec<TimedWord>> {
+    let texts = lyric_word_texts(lines);
+    // Flatten to (line, word text, timing).
+    let mut flat: Vec<(usize, String, Option<TimedWord>)> = Vec::new();
+    for (line_idx, (words, texts)) in matched.into_iter().zip(texts).enumerate() {
+        for (w, text) in words.into_iter().zip(texts) {
+            flat.push((line_idx, text, w));
+        }
+    }
+
+    let line_start = |l: usize| lines.get(l).and_then(|x| x.ts_ms).map(|t| t as f64 / 1000.0);
+    let mut k = 0;
+    while k < flat.len() {
+        if flat[k].2.is_some() {
+            k += 1;
+            continue;
+        }
+        // Run of untimed words inside one line.
+        let line = flat[k].0;
+        let run_start = k;
+        while k < flat.len() && flat[k].2.is_none() && flat[k].0 == line {
+            k += 1;
+        }
+        let run_end = k;
+
+        let prev = flat[..run_start].iter().rev().find_map(|(l, _, t)| t.as_ref().map(|t| (*l, t.end)));
+        let next = flat[run_end..].iter().find_map(|(l, _, t)| t.as_ref().map(|t| (*l, t.start)));
+        let mut lower = prev.map(|(_, e)| e).unwrap_or(0.0);
+        if let Some(ts) = line_start(line) {
+            lower = lower.max(ts);
+        }
+        let mut upper = next.map(|(_, s)| s);
+        if let Some(ts) = line_start(line + 1) {
+            upper = Some(upper.map_or(ts, |u| u.min(ts)));
+        }
+
+        let count = (run_end - run_start) as f64;
+        let weights: Vec<f64> = flat[run_start..run_end].iter().map(|(_, t, _)| t.chars().count().max(1) as f64).collect();
+        let total_w: f64 = weights.iter().sum();
+        let (span_start, span_len) = match upper.filter(|u| *u > lower) {
+            Some(u) if u - lower <= MAX_ESTIMATED_WORD_SEC * count => (lower, u - lower),
+            Some(u) => {
+                let len = DEFAULT_WORD_SEC * count;
+                // Words at the start of a line whose next timed word is in the
+                // same line belong before it; otherwise they follow the previous one.
+                let anchored_after = next.map_or(false, |(l, _)| l == line) && prev.map_or(true, |(l, _)| l != line);
+                if anchored_after { (u - len, len) } else { (lower, len) }
+            }
+            None => (lower, DEFAULT_WORD_SEC * count),
+        };
+
+        let mut cursor = span_start;
+        for (i, entry) in flat[run_start..run_end].iter_mut().enumerate() {
+            let dur = span_len * weights[i] / total_w;
+            entry.2 = Some(TimedWord {
+                word: entry.1.clone(),
+                start: cursor,
+                end: cursor + dur,
+                confidence: None,
+                estimated: true,
+            });
+            cursor += dur;
+        }
+    }
+
+    let mut out: Vec<Vec<TimedWord>> = vec![Vec::new(); lines.len()];
+    for (line, _, t) in flat {
+        if let Some(t) = t {
+            out[line].push(t);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tw(word: &str, start: f64, end: f64, conf: f32) -> TimedWord {
-        TimedWord { word: word.into(), start, end, confidence: Some(conf) }
+        TimedWord { word: word.into(), start, end, confidence: Some(conf), estimated: false }
     }
 
     fn line(text: &str, ts: Option<u64>) -> LyricLine {
@@ -428,6 +670,48 @@ mod tests {
         assert_eq!(e[1].start_ms, 1400);
         assert_eq!(e[2].end_ms, 3000);
         assert_eq!(e[1].end_ms, e[2].start_ms);
+    }
+
+    fn asr(word: &str, start: f64) -> TimedWord {
+        TimedWord { word: word.into(), start, end: start + 0.3, confidence: None, estimated: false }
+    }
+
+    #[test]
+    fn segments_transcription_on_pauses_and_punctuation() {
+        let words = vec![asr("Ciao", 0.0), asr("amore.", 0.4), asr("Resta", 0.8), asr("qui", 1.2), asr("stanotte", 3.0)];
+        let lines = segment_lines(words);
+        let texts: Vec<String> = lines.iter().map(|l| l.iter().map(|w| w.word.clone()).collect::<Vec<_>>().join(" ")).collect();
+        assert_eq!(texts, vec!["Ciao amore.", "Resta qui", "stanotte"]);
+        let lyric = lines_from_segments(&lines);
+        assert_eq!(lyric[1], line("Resta qui", Some(800)));
+    }
+
+    #[test]
+    fn matches_lyrics_to_transcript_in_order() {
+        let lines = vec![line("Ciao bella, ciao!", None), line("2 volte", None)];
+        let recognized = vec![asr("ciao", 1.0), asr("bela", 1.5), asr("extra", 2.0), asr("ciao", 2.5), asr("volte", 4.0)];
+        let m = match_transcript(&lines, &recognized);
+        assert_eq!(m[0].len(), 3);
+        assert_eq!(m[0][0].as_ref().unwrap().start, 1.0);
+        assert_eq!(m[0][1].as_ref().unwrap().start, 1.5); // "bella" ~ "bela"
+        assert_eq!(m[0][2].as_ref().unwrap().start, 2.5); // skips "extra"
+        assert!(m[1][0].is_none()); // "2" was not recognized
+        assert_eq!(m[1][1].as_ref().unwrap().word, "volte");
+    }
+
+    #[test]
+    fn fills_unmatched_words_between_anchors_and_line_times() {
+        let lines = vec![line("uno due tre", Some(1000)), line("quattro cinque", Some(10_000))];
+        let matched = vec![
+            vec![Some(asr("uno", 1.0)), None, Some(asr("tre", 2.0))],
+            vec![None, None],
+        ];
+        let filled = fill_missing(&lines, matched);
+        let due = &filled[0][1];
+        assert!(due.estimated && due.start >= 1.3 && due.end <= 2.0 + 1e-9, "{:?}", due);
+        // Whole line unmatched: starts at its LRC time, not after the long gap.
+        assert!((filled[1][0].start - 10.0).abs() < 1e-9);
+        assert!(filled[1][1].start > filled[1][0].start);
     }
 
     #[test]

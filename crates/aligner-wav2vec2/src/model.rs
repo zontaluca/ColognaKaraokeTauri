@@ -90,14 +90,14 @@ impl OnnxSession {
         // very slow first-run model compilation when the CoreML cache is cold).
         #[cfg(feature = "coreml")]
         {
-            use ort::execution_providers::CoreMLExecutionProvider;
+            use ort::ep::CoreML as CoreMLExecutionProvider;
             builder = builder
                 .with_execution_providers([CoreMLExecutionProvider::default().build()])
                 .map_err(|e| AlignError::ModelLoad(format!("coreml ep: {}", e)))?;
         }
         #[cfg(feature = "cuda")]
         {
-            use ort::execution_providers::CUDAExecutionProvider;
+            use ort::ep::CUDA as CUDAExecutionProvider;
             builder = builder
                 .with_execution_providers([CUDAExecutionProvider::default().build()])
                 .map_err(|e| AlignError::ModelLoad(format!("cuda ep: {}", e)))?;
@@ -106,7 +106,7 @@ impl OnnxSession {
         // runtime cannot fall back to auto-detected platform EPs (CoreML on macOS).
         #[cfg(not(any(feature = "coreml", feature = "cuda")))]
         {
-            use ort::execution_providers::CPUExecutionProvider;
+            use ort::ep::CPU as CPUExecutionProvider;
             builder = builder
                 .with_execution_providers([CPUExecutionProvider::default().build()])
                 .map_err(|e| AlignError::ModelLoad(format!("cpu ep: {}", e)))?;

@@ -14,7 +14,7 @@ dependencies at runtime: alignment runs in Rust through ONNX Runtime (`ort`).
 - **Frontend:** React 18 + Vite, plain CSS with token-based design system
 - **Shell:** Tauri 2 (Rust)
 - **Sidecar binaries:** `yt-dlp` (audio download), `demucs` ([demucs-rs](https://github.com/nikhilunni/demucs-rs) native inference)
-- **Rust crates:** `ort` + workspace crate `aligner-wav2vec2` (word alignment), `cpal` (mic I/O), `pitch-detection` (YIN),
+- **Rust crates:** `ort` + workspace crate `aligner-wav2vec2` (word alignment), `parakeet-rs` (Parakeet TDT v3 ASR), `cpal` (mic I/O), `pitch-detection` (YIN),
   `rusqlite` (leaderboard), `rubato` (resampling), `symphonia` (audio decode), `hound` (WAV)
 - **Lyrics:** [lrclib.net](https://lrclib.net)
 - **Album art:** iTunes Search API, Cover Art Archive fallback
@@ -29,7 +29,7 @@ dependencies at runtime: alignment runs in Rust through ONNX Runtime (`ort`).
 
 ```bash
 pnpm install
-./scripts/fetch-binaries.sh    # yt-dlp + demucs + wav2vec2 ONNX model(s)
+./scripts/fetch-binaries.sh    # yt-dlp + demucs + wav2vec2 ONNX model(s) + Parakeet v3 INT8 (~670 MB)
 pnpm tauri dev
 ```
 
@@ -51,7 +51,9 @@ Mic permission is requested on first Challenge-mode play (macOS prompts via `NSM
 1. Fetch LRC lyrics (`lrclib`)
 2. Fetch album art (`iTunes` / `Cover Art Archive`)
 3. Separate vocals (`demucs-rs`)
-4. Align words (wav2vec2 CTC forced alignment against the LRC) — **mandatory**
+4. Align words (wav2vec2 CTC forced alignment against the lyrics, refined per LRC line) — **mandatory**.
+   Plain lyrics get a generated synced LRC; without lyrics (or without a wav2vec2 model for the
+   language) Parakeet TDT 0.6B v3 transcribes the vocals and the LRC Enhanced is built from it.
 5. Compute reference pitch contour (`pitch-detection` YIN), concurrently with step 4
 6. Save metadata
 

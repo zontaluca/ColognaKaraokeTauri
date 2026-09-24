@@ -35,8 +35,14 @@ byteorder = "1"
 crc32fast = "1"
 base64 = "0.22"
 parking_lot = "0.12"
+dirs-next = "2"
 symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
 mp3lame-encoder = "0.2"
+
+# Parakeet TDT 0.6B v3 (multilingual ASR) on ONNX Runtime: transcribes songs
+# without lyrics and times lyrics when no wav2vec2 model fits the language.
+# api-28 matches the ONNX Runtime 1.28 that `ort` rc.13 downloads.
+parakeet-rs = { version = "0.3.8", default-features = false, features = ["cpu", "api-28"] }
 
 aligner-pipeline = { path = "../crates/aligner-pipeline" }
 aligner-wav2vec2 = { path = "../crates/aligner-wav2vec2" }

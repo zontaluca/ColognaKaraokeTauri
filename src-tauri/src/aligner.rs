@@ -9,15 +9,25 @@ use serde_json::Value;
 use tauri::AppHandle;
 
 use crate::word_timing::{
-    build_entries, estimate_lrc_offset_ms, generate_lrc, generate_lrc_from_json, line_windows,
-    mean_confidence, parse_lyrics, split_by_counts, LyricsInput, TimedWord, WordEntry,
+    build_entries, estimate_lrc_offset_ms, fill_missing, generate_lrc, generate_lrc_from_json,
+    line_windows, lines_from_segments, match_transcript, mean_confidence, parse_lyrics,
+    segment_lines, shift_lines, split_by_counts, LyricLine, LyricsInput, TimedWord, WordEntry,
 };
 
 /// Result of [`run_alignment`] (words.json itself is written to the song dir).
 pub struct AlignmentOutput {
     /// Synced LRC built from the word timings when the input lyrics were plain
-    /// (unsynced) text; to be stored as the song's lyrics.
+    /// (unsynced) text or missing; to be stored as the song's lyrics.
     pub generated_lrc: Option<String>,
+    /// How `generated_lrc` was produced: "alignment" (plain lyrics timed) or
+    /// "asr" (transcribed by Parakeet).
+    pub lrc_source: &'static str,
+}
+
+impl AlignmentOutput {
+    fn none() -> Self {
+        Self { generated_lrc: None, lrc_source: "alignment" }
+    }
 }
 
 /// Detect language of LRC text by counting stopword hits. Returns ISO-639-1 code
@@ -85,6 +95,7 @@ pub fn release_model_cache() {
     if MODEL_CACHE.lock().take().is_some() {
         eprintln!("[aligner/W2V] model cache released");
     }
+    crate::asr::release_model_cache();
 }
 
 async fn load_aligner(language: &str, local_dir: PathBuf) -> Result<SharedAligner, String> {
@@ -218,7 +229,7 @@ async fn try_wav2vec2_ctc_alignment(
             .align_emissions(&emissions, &concat_lyrics, None)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|w| TimedWord { word: w.word, start: w.start, end: w.end, confidence: Some(w.confidence) })
+            .map(|w| TimedWord { word: w.word, start: w.start, end: w.end, confidence: Some(w.confidence), estimated: false })
             .collect();
         // Walk aligned words alongside LRC lines, attributing each output word to
         // the line it came from (LRC token order is preserved by `align`).
@@ -240,7 +251,7 @@ async fn try_wav2vec2_ctc_alignment(
                 }
                 let candidate: Vec<TimedWord> = words
                     .into_iter()
-                    .map(|w| TimedWord { word: w.word, start: w.start, end: w.end, confidence: Some(w.confidence) })
+                    .map(|w| TimedWord { word: w.word, start: w.start, end: w.end, confidence: Some(w.confidence), estimated: false })
                     .collect();
                 if mean_confidence(&candidate) > mean_confidence(&per_line[i]) {
                     per_line[i] = candidate;
@@ -274,17 +285,82 @@ async fn try_wav2vec2_ctc_alignment(
 
 // ─── Public entry point ──────────────────────────────────────────────────────
 
+// ─── Parakeet fallbacks ──────────────────────────────────────────────────────
+
+/// Songs without lyrics: transcribe the vocals, segment the words into lines
+/// and return (lines, per-line words).
+async fn transcribe_lyrics(vocals: Arc<AudioBuffer>) -> Option<(Vec<LyricLine>, Vec<Vec<TimedWord>>)> {
+    let words = match crate::asr::transcribe(vocals).await {
+        Ok(w) if !w.is_empty() => w,
+        Ok(_) => {
+            eprintln!("[aligner/ASR] Parakeet produced no words");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[aligner/ASR] {}", e);
+            return None;
+        }
+    };
+    let segments = segment_lines(words);
+    let lines = lines_from_segments(&segments);
+    Some((lines, segments))
+}
+
+/// Lyrics that wav2vec2 could not align (no model for the language, or the
+/// alignment failed): time them by matching against a Parakeet transcription.
+/// Returns the (offset-corrected) lines and per-line words.
+async fn time_lyrics_with_asr(
+    input: &LyricsInput,
+    vocals: Arc<AudioBuffer>,
+) -> Option<(Vec<LyricLine>, Vec<Vec<TimedWord>>)> {
+    let recognized = match crate::asr::transcribe(vocals).await {
+        Ok(w) if !w.is_empty() => w,
+        Ok(_) => return None,
+        Err(e) => {
+            eprintln!("[aligner/ASR] {}", e);
+            return None;
+        }
+    };
+    let matched = match_transcript(&input.lines, &recognized);
+    let matched_count = matched.iter().flatten().filter(|w| w.is_some()).count();
+    let total = matched.iter().map(Vec::len).sum::<usize>();
+    if matched_count == 0 {
+        eprintln!("[aligner/ASR] transcription shares no words with the lyrics");
+        return None;
+    }
+    // LRC timestamps may be offset from the audio: measure it on the matched words.
+    let anchors: Vec<Vec<TimedWord>> = matched.iter().map(|ws| ws.iter().flatten().cloned().collect()).collect();
+    let offset = if input.synced { estimate_lrc_offset_ms(&input.lines, &anchors) } else { None };
+    let lines = match offset {
+        Some(off) => shift_lines(&input.lines, off),
+        None => input.lines.clone(),
+    };
+    eprintln!(
+        "[aligner/ASR] matched {}/{} lyric words to the transcription (LRC offset {:?} ms)",
+        matched_count, total, offset
+    );
+    let per_line = fill_missing(&lines, matched);
+    Some((lines, per_line))
+}
+
+// ─── Public entry point ──────────────────────────────────────────────────────
+
 /// True when [`run_alignment`] will actually need the decoded vocals (no cached
-/// words.json and some lyrics to align against).
+/// words.json and either lyrics to align or Parakeet to transcribe).
 pub fn alignment_needed(dir: &Path, lrc: Option<&str>) -> bool {
-    !dir.join("words.json").exists() && lrc.and_then(parse_lyrics).is_some()
+    !dir.join("words.json").exists()
+        && (lrc.and_then(parse_lyrics).is_some() || crate::asr::is_available())
 }
 
 /// `vocals` is the decoded vocals.mp3 at its native rate (shared with the pitch
 /// stage so the file is decoded only once); `None` when it is missing.
 ///
-/// Synced LRC and plain lyrics are both aligned; for plain lyrics a synced LRC
-/// is generated from the word timings.
+/// - Synced LRC and plain lyrics are aligned with wav2vec2; for plain lyrics a
+///   synced LRC is generated from the word timings.
+/// - If wav2vec2 can't run (no model for the language), the lyrics are timed
+///   from a Parakeet transcription instead.
+/// - Without lyrics, Parakeet transcribes the song and the LRC is generated
+///   from the transcription.
 pub async fn run_alignment(
     dir: &Path,
     lrc: Option<&str>,
@@ -302,36 +378,58 @@ pub async fn run_alignment(
             .as_ref()
             .filter(|i| !i.synced)
             .and_then(|i| generate_lrc_from_json(&i.lines, &words));
-        return Ok(AlignmentOutput { generated_lrc });
+        return Ok(AlignmentOutput { generated_lrc, lrc_source: "alignment" });
     }
 
     let Some(input) = input else {
+        // No lyrics at all: transcribe when Parakeet is installed.
+        if let Some(vocals) = vocals.filter(|_| crate::asr::is_available()) {
+            on_phrase_progress(0, 1);
+            if let Some((lines, per_line)) = transcribe_lyrics(vocals).await {
+                let entries = build_entries(&lines, per_line, None);
+                eprintln!("[aligner/ASR] transcribed {} words in {} lines", entries.len(), lines.len());
+                write_words_json(dir, &entries)?;
+                on_phrase_progress(1, 1);
+                return Ok(AlignmentOutput {
+                    generated_lrc: Some(generate_lrc(&lines, &entries)),
+                    lrc_source: "asr",
+                });
+            }
+        }
         eprintln!("[aligner] no lyrics — writing empty words.json");
         write_empty_words(dir)?;
-        return Ok(AlignmentOutput { generated_lrc: None });
+        return Ok(AlignmentOutput::none());
     };
 
-    match try_wav2vec2_ctc_alignment(&input, vocals, on_phrase_progress).await {
-        Some((per_line, offset_ms)) => {
-            let entries = build_entries(&input.lines, per_line, offset_ms);
-            let estimated = entries.iter().filter(|e| e.estimated).count();
-            eprintln!(
-                "[aligner/W2V] aligned {} words across {} lines ({} re-timed from low confidence)",
-                entries.len(),
-                input.lines.len(),
-                estimated
-            );
+    if let Some((per_line, offset_ms)) = try_wav2vec2_ctc_alignment(&input, vocals.clone(), on_phrase_progress).await {
+        let entries = build_entries(&input.lines, per_line, offset_ms);
+        let estimated = entries.iter().filter(|e| e.estimated).count();
+        eprintln!(
+            "[aligner/W2V] aligned {} words across {} lines ({} re-timed from low confidence)",
+            entries.len(),
+            input.lines.len(),
+            estimated
+        );
+        let generated_lrc = (!input.synced && !entries.is_empty())
+            .then(|| generate_lrc(&input.lines, &entries));
+        write_words_json(dir, &entries)?;
+        return Ok(AlignmentOutput { generated_lrc, lrc_source: "alignment" });
+    }
+
+    if let Some(vocals) = vocals.filter(|_| crate::asr::is_available()) {
+        eprintln!("[aligner/W2V] unavailable; timing lyrics from a Parakeet transcription");
+        if let Some((lines, per_line)) = time_lyrics_with_asr(&input, vocals).await {
+            let entries = build_entries(&lines, per_line, None);
             let generated_lrc = (!input.synced && !entries.is_empty())
                 .then(|| generate_lrc(&input.lines, &entries));
             write_words_json(dir, &entries)?;
-            Ok(AlignmentOutput { generated_lrc })
-        }
-        None => {
-            eprintln!("[aligner/W2V] failed; writing empty words.json");
-            write_empty_words(dir)?;
-            Ok(AlignmentOutput { generated_lrc: None })
+            return Ok(AlignmentOutput { generated_lrc, lrc_source: "alignment" });
         }
     }
+
+    eprintln!("[aligner/W2V] failed; writing empty words.json");
+    write_empty_words(dir)?;
+    Ok(AlignmentOutput::none())
 }
 
 // ─── Tauri commands ──────────────────────────────────────────────────────────
