@@ -2,6 +2,7 @@ mod aligner;
 mod audio;
 mod cloud;
 mod downloader;
+mod http;
 mod jobs;
 mod leaderboard;
 mod library;
@@ -14,7 +15,6 @@ mod recorder;
 mod recognizer;
 mod separator;
 mod settings;
-mod vad;
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 

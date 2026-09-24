@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use aligner_pipeline::AudioBuffer;
+use aligner_wav2vec2::Wav2vecAligner;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
@@ -62,11 +66,6 @@ fn clean_token(raw: &str) -> String {
         .to_string()
 }
 
-fn load_wav_mono_16k(path: &Path) -> Result<AudioBuffer, String> {
-    let samples = crate::audio::load_wav_mono_16k(path)?;
-    Ok(AudioBuffer { samples, sample_rate: 16_000 })
-}
-
 fn write_words_json(dir: &Path, words: &[WordEntry]) -> Result<Value, String> {
     let arr: Vec<Value> = words.iter().map(|w| w.to_json()).collect();
     let path = dir.join("words.json");
@@ -87,24 +86,77 @@ fn wav2vec2_local_dir(language: &str) -> PathBuf {
     aligner_wav2vec2::default_local_dir(language)
 }
 
+type SharedAligner = Arc<Mutex<Wav2vecAligner>>;
+
+/// wav2vec2 aligner kept loaded between consecutive jobs, keyed by language.
+/// Building the ONNX session for XLSR-53 (~1.2 GB) takes seconds, so the job
+/// queue reuses it and calls [`release_model_cache`] once it drains.
+static MODEL_CACHE: Lazy<Mutex<Option<(String, SharedAligner)>>> = Lazy::new(|| Mutex::new(None));
+
+/// Drop the cached wav2vec2 session (frees its memory once no alignment still
+/// holds a reference to it).
+pub fn release_model_cache() {
+    if MODEL_CACHE.lock().take().is_some() {
+        eprintln!("[aligner/W2V] model cache released");
+    }
+}
+
+async fn load_aligner(language: &str, local_dir: PathBuf) -> Result<SharedAligner, String> {
+    use aligner_wav2vec2::{AlignmentConfig as W2VConfig, ModelSource};
+
+    {
+        let mut cache = MODEL_CACHE.lock();
+        match cache.as_ref() {
+            Some((lang, aligner)) if lang == language => return Ok(aligner.clone()),
+            // A model for another language: drop it before loading the new one
+            // so the two never sit in memory together.
+            Some(_) => *cache = None,
+            None => {}
+        }
+    }
+
+    let config = W2VConfig {
+        source: ModelSource::LocalDir(local_dir),
+        language: language.to_string(),
+        ..Default::default()
+    };
+    // Session construction (graph optimisation of a large model) is CPU-bound:
+    // keep it off the async runtime.
+    let handle = tokio::runtime::Handle::current();
+    let aligner = tokio::task::spawn_blocking(move || handle.block_on(Wav2vecAligner::new(config)))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    let shared: SharedAligner = Arc::new(Mutex::new(aligner));
+    *MODEL_CACHE.lock() = Some((language.to_string(), shared.clone()));
+    Ok(shared)
+}
+
+/// Resample decoded vocals to 16 kHz and crop them to the sung range.
+/// Returns the cropped buffer plus the (onset, offset) of the range in seconds.
+fn prepare_vocals_16k(vocals: &AudioBuffer) -> Result<(AudioBuffer, f64, f64), String> {
+    const SR: u32 = 16_000;
+    let mut samples = crate::audio::resample_to(&vocals.samples, vocals.sample_rate, SR)?;
+    let (vocal_onset, vocal_offset) = aligner_pipeline::detect_vocal_range(&samples, SR);
+    let sr = SR as f64;
+    let s_idx = ((vocal_onset * sr) as usize).min(samples.len());
+    let e_idx = ((vocal_offset * sr) as usize).min(samples.len());
+    if e_idx > s_idx {
+        // Crop in place rather than copying the kept range into a new buffer.
+        samples.truncate(e_idx);
+        samples.drain(..s_idx);
+    }
+    Ok((AudioBuffer { samples, sample_rate: SR }, vocal_onset, vocal_offset))
+}
+
 async fn try_wav2vec2_ctc_alignment(
-    dir: &Path,
     lrc_text: &str,
+    vocals: Option<Arc<AudioBuffer>>,
     on_progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Option<Vec<WordEntry>> {
-    use aligner_wav2vec2::{AlignmentConfig as W2VConfig, ModelSource, Wav2vecAligner};
-
-    let vocals_path = dir.join("vocals.mp3");
-    if !vocals_path.exists() {
+    let Some(vocals) = vocals else {
         eprintln!("[aligner/W2V] missing vocals.mp3");
         return None;
-    }
-    let mut vocals = match load_wav_mono_16k(&vocals_path) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[aligner/W2V] WAV load failed: {}", e);
-            return None;
-        }
     };
 
     let lrc_lines = crate::lyrics::parse_lrc(lrc_text);
@@ -112,10 +164,14 @@ async fn try_wav2vec2_ctc_alignment(
         eprintln!("[aligner/W2V] empty LRC");
         return None;
     }
-    let total_words: usize = lrc_lines
+    // Count words the way the wav2vec2 tokenizer does: tokens with no letters
+    // (numbers, "&", "…") are dropped from the aligned output, and counting
+    // them here would shift every following word onto the wrong line.
+    let line_word_counts: Vec<usize> = lrc_lines
         .iter()
-        .map(|l| l.text.split_whitespace().count())
-        .sum();
+        .map(|l| aligner_wav2vec2::text::count_alignable_words(&l.text))
+        .collect();
+    let total_words: usize = line_word_counts.iter().sum();
     if total_words == 0 {
         eprintln!("[aligner/W2V] no words in LRC");
         return None;
@@ -123,24 +179,6 @@ async fn try_wav2vec2_ctc_alignment(
 
     let language = detect_lrc_language(lrc_text).unwrap_or("it");
     on_progress(0, total_words);
-
-    let (vocal_onset, vocal_offset) = aligner_pipeline::detect_vocal_range(
-        &vocals.samples,
-        vocals.sample_rate,
-    );
-    let sr = vocals.sample_rate as f64;
-    let s_idx = ((vocal_onset * sr) as usize).min(vocals.samples.len());
-    let e_idx = ((vocal_offset * sr) as usize).min(vocals.samples.len());
-    if e_idx > s_idx {
-        vocals.samples = vocals.samples[s_idx..e_idx].to_vec();
-    }
-    eprintln!(
-        "[aligner/W2V] vocal range {:.2}..{:.2}s, {} samples, lang={}",
-        vocal_onset,
-        vocal_offset,
-        vocals.samples.len(),
-        language,
-    );
 
     let local_dir = wav2vec2_local_dir(language);
     if !local_dir.join("model.onnx").exists() || !local_dir.join("vocab.json").exists() {
@@ -150,12 +188,28 @@ async fn try_wav2vec2_ctc_alignment(
         );
         return None;
     }
-    let config = W2VConfig {
-        source: ModelSource::LocalDir(local_dir),
-        language: language.to_string(),
-        ..Default::default()
+
+    let prepared = tokio::task::spawn_blocking(move || prepare_vocals_16k(&vocals)).await;
+    let (vocals_16k, vocal_onset, vocal_offset) = match prepared {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            eprintln!("[aligner/W2V] resample failed: {}", e);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[aligner/W2V] resample task failed: {}", e);
+            return None;
+        }
     };
-    let mut aligner = match Wav2vecAligner::new(config).await {
+    eprintln!(
+        "[aligner/W2V] vocal range {:.2}..{:.2}s, {} samples, lang={}",
+        vocal_onset,
+        vocal_offset,
+        vocals_16k.samples.len(),
+        language,
+    );
+
+    let aligner = match load_aligner(language, local_dir).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("[aligner/W2V] init failed: {}", e);
@@ -169,10 +223,19 @@ async fn try_wav2vec2_ctc_alignment(
         .collect::<Vec<&str>>()
         .join(" ");
 
-    let aligned = match aligner.align(&vocals, &concat_lyrics, vocal_onset) {
-        Ok(w) => w,
-        Err(e) => {
+    // ONNX inference + CTC take tens of seconds of CPU: run them on a blocking thread.
+    let aligned = tokio::task::spawn_blocking(move || {
+        aligner.lock().align_owned(vocals_16k, &concat_lyrics, vocal_onset)
+    })
+    .await;
+    let aligned = match aligned {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => {
             eprintln!("[aligner/W2V] align failed: {}", e);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[aligner/W2V] align task failed: {}", e);
             return None;
         }
     };
@@ -182,8 +245,7 @@ async fn try_wav2vec2_ctc_alignment(
     // the line it came from (LRC token order is preserved by `align`).
     let mut cursor = 0usize;
     let mut out: Vec<WordEntry> = Vec::with_capacity(aligned.len());
-    for (line_idx, line) in lrc_lines.iter().enumerate() {
-        let line_word_count = line.text.split_whitespace().count();
+    for (line_idx, line_word_count) in line_word_counts.iter().copied().enumerate() {
         let line_end_ms = lrc_lines
             .get(line_idx + 1)
             .map(|l| l.ts_ms)
@@ -242,9 +304,22 @@ async fn try_wav2vec2_ctc_alignment(
 
 // ─── Public entry point ──────────────────────────────────────────────────────
 
+fn synced_lrc(lrc: Option<&str>) -> Option<&str> {
+    lrc.filter(|t| t.contains('['))
+}
+
+/// True when [`run_alignment`] will actually need the decoded vocals (no cached
+/// words.json and a synced LRC to align against).
+pub fn alignment_needed(dir: &Path, lrc: Option<&str>) -> bool {
+    !dir.join("words.json").exists() && synced_lrc(lrc).is_some()
+}
+
+/// `vocals` is the decoded vocals.mp3 at its native rate (shared with the pitch
+/// stage so the file is decoded only once); `None` when it is missing.
 pub async fn run_alignment(
     dir: &Path,
     lrc: Option<&str>,
+    vocals: Option<Arc<AudioBuffer>>,
     on_phrase_progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Result<Value, String> {
     let words_path = dir.join("words.json");
@@ -253,7 +328,7 @@ pub async fn run_alignment(
         return serde_json::from_str(&s).map_err(|e| e.to_string());
     }
 
-    let lrc_text = match lrc.filter(|t| t.contains('[')) {
+    let lrc_text = match synced_lrc(lrc) {
         Some(t) => t,
         None => {
             eprintln!("[aligner] no synced LRC — writing empty words.json");
@@ -261,7 +336,7 @@ pub async fn run_alignment(
         }
     };
 
-    match try_wav2vec2_ctc_alignment(dir, lrc_text, on_phrase_progress).await {
+    match try_wav2vec2_ctc_alignment(lrc_text, vocals, on_phrase_progress).await {
         Some(words) => write_words_json(dir, &words),
         None => {
             eprintln!("[aligner/W2V] failed; writing empty words.json");
@@ -272,7 +347,7 @@ pub async fn run_alignment(
 
 // ─── Tauri commands ──────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_words(dir: String) -> Result<Value, String> {
     let words_path = PathBuf::from(&dir).join("words.json");
     if words_path.exists() {

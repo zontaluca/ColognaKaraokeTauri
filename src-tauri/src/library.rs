@@ -29,13 +29,34 @@ pub fn save_metadata(dir: &Path, meta: &serde_json::Value) -> Result<(), String>
     Ok(())
 }
 
+/// True when words.json holds at least one word. Reads only the first bytes
+/// instead of parsing the whole (pretty-printed) file on every library scan.
+fn has_word_timestamps(words_path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(file) = fs::File::open(words_path) else { return false };
+    let mut head = [0u8; 64];
+    let mut len = 0;
+    let mut reader = file.take(head.len() as u64);
+    while len < head.len() {
+        match reader.read(&mut head[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(_) => return false,
+        }
+    }
+    let mut bytes = head[..len].iter().copied().filter(|b| !b.is_ascii_whitespace());
+    // An array with a first element: "[" followed by anything but "]".
+    bytes.next() == Some(b'[') && matches!(bytes.next(), Some(b) if b != b']')
+}
+
 fn load_metadata(dir: &Path) -> Option<serde_json::Value> {
     let path = dir.join("metadata.json");
     let s = fs::read_to_string(path).ok()?;
     serde_json::from_str(&s).ok()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn scan_library(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let dir = library_dir(&app);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -61,12 +82,7 @@ pub fn scan_library(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
                     "has_original".to_string(),
                     serde_json::Value::Bool(path.join("original.mp3").exists()),
                 );
-                let words_path = path.join("words.json");
-                let lrc_enhanced = fs::read_to_string(&words_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
-                    .unwrap_or(false);
+                let lrc_enhanced = has_word_timestamps(&path.join("words.json"));
                 obj.insert(
                     "lrc_enhanced".to_string(),
                     serde_json::Value::Bool(lrc_enhanced),
@@ -96,15 +112,14 @@ pub fn scan_library(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
         }
     }
 
-    songs.sort_by(|a, b| {
-        let ta = a.get("title").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-        let tb = b.get("title").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-        ta.cmp(&tb)
+    // Lowercase each title once instead of twice per comparison.
+    songs.sort_by_cached_key(|s| {
+        s.get("title").and_then(|v| v.as_str()).unwrap_or("").to_lowercase()
     });
     Ok(songs)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_song(dir: String) -> Result<(), String> {
     let p = PathBuf::from(&dir);
     if p.exists() {
@@ -118,7 +133,7 @@ pub fn get_library_dir(app: AppHandle) -> Result<String, String> {
     Ok(library_dir(&app).to_string_lossy().into_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_lrc_offset(dir: String, offset: f64) -> Result<(), String> {
     let p = PathBuf::from(&dir);
     let meta_path = p.join("metadata.json");
@@ -132,7 +147,7 @@ pub fn set_lrc_offset(dir: String, offset: f64) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_song_audio_path(dir: String, prefer_instrumental: bool) -> Result<String, String> {
     let p = PathBuf::from(&dir);
     if prefer_instrumental {
@@ -150,4 +165,24 @@ pub fn get_song_audio_path(dir: String, prefer_instrumental: bool) -> Result<Str
         }
     }
     Err("No audio file found".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_word_timestamps;
+
+    #[test]
+    fn detects_non_empty_words_json() {
+        let dir = std::env::temp_dir().join(format!("ck-words-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("words.json");
+        std::fs::write(&p, "[]").unwrap();
+        assert!(!has_word_timestamps(&p));
+        std::fs::write(&p, "[\n  ]").unwrap();
+        assert!(!has_word_timestamps(&p));
+        std::fs::write(&p, "[\n  {\n    \"word\": \"ciao\"}]").unwrap();
+        assert!(has_word_timestamps(&p));
+        assert!(!has_word_timestamps(&dir.join("missing.json")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

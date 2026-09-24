@@ -7,7 +7,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 use tauri::{AppHandle, Manager, State};
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_mic_devices() -> Vec<String> {
     let host = cpal::default_host();
     host.input_devices()
@@ -40,6 +40,10 @@ pub enum RecCmd {
 pub type RecorderTx = Arc<Mutex<Option<Sender<RecCmd>>>>;
 
 const BUFFER_WINDOW_SAMPLES: usize = 16000 * 4;
+/// The live buffer may grow to this size before being trimmed back to
+/// `BUFFER_WINDOW_SAMPLES`, so the front drain (a memmove of the whole
+/// window) happens once per window instead of on every audio callback.
+const BUFFER_TRIM_THRESHOLD: usize = BUFFER_WINDOW_SAMPLES * 2;
 
 pub fn init(app: &AppHandle) {
     let buf: MicBufferState = Arc::new(Mutex::new(MicBuffer::default()));
@@ -139,12 +143,17 @@ fn start_stream(
     let buf_cb = buf.clone();
     let writer_cb = writer.clone();
 
+    // Scratch buffer owned by the stream callback: after the first callbacks it
+    // has enough capacity and the audio thread no longer allocates.
+    let mut mono: Vec<f32> = Vec::new();
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
             let cfg: cpal::StreamConfig = config.into();
             device.build_input_stream(
                 &cfg,
-                move |data: &[f32], _| process_input(data, channels, &buf_cb, &writer_cb),
+                move |data: &[f32], _| {
+                    process_input(data.iter().copied(), channels, &mut mono, &buf_cb, &writer_cb)
+                },
                 |e| eprintln!("mic stream error: {}", e),
                 None,
             )
@@ -154,8 +163,8 @@ fn start_stream(
             device.build_input_stream(
                 &cfg,
                 move |data: &[i16], _| {
-                    let f: Vec<f32> = data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                    process_input(&f, channels, &buf_cb, &writer_cb);
+                    let f = data.iter().map(|s| *s as f32 / i16::MAX as f32);
+                    process_input(f, channels, &mut mono, &buf_cb, &writer_cb);
                 },
                 |e| eprintln!("mic stream error: {}", e),
                 None,
@@ -166,11 +175,8 @@ fn start_stream(
             device.build_input_stream(
                 &cfg,
                 move |data: &[u16], _| {
-                    let f: Vec<f32> = data
-                        .iter()
-                        .map(|s| (*s as f32 - 32768.0) / 32768.0)
-                        .collect();
-                    process_input(&f, channels, &buf_cb, &writer_cb);
+                    let f = data.iter().map(|s| (*s as f32 - 32768.0) / 32768.0);
+                    process_input(f, channels, &mut mono, &buf_cb, &writer_cb);
                 },
                 |e| eprintln!("mic stream error: {}", e),
                 None,
@@ -185,31 +191,51 @@ fn start_stream(
 }
 
 fn process_input(
-    data: &[f32],
+    data: impl Iterator<Item = f32>,
     channels: usize,
+    mono: &mut Vec<f32>,
     buf: &MicBufferState,
     writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
 ) {
-    let mono: Vec<f32> = if channels <= 1 {
-        data.to_vec()
-    } else {
-        data.chunks(channels)
-            .map(|c| c.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
+    downmix(data, channels, mono);
     {
         let mut b = buf.lock();
-        b.samples.extend_from_slice(&mono);
-        if b.samples.len() > BUFFER_WINDOW_SAMPLES {
+        b.samples.extend_from_slice(mono);
+        if b.samples.len() > BUFFER_TRIM_THRESHOLD {
             let drop_n = b.samples.len() - BUFFER_WINDOW_SAMPLES;
             b.samples.drain(..drop_n);
         }
     }
     if let Some(w) = writer.lock().as_mut() {
-        for s in mono {
+        for &s in mono.iter() {
             let clamped = s.clamp(-1.0, 1.0);
             let _ = w.write_sample((clamped * i16::MAX as f32) as i16);
         }
+    }
+}
+
+/// Average interleaved frames into `out` (cleared first, capacity reused).
+fn downmix(data: impl Iterator<Item = f32>, channels: usize, out: &mut Vec<f32>) {
+    out.clear();
+    if channels <= 1 {
+        out.extend(data);
+        return;
+    }
+    let inv = 1.0 / channels as f32;
+    let mut acc = 0.0_f32;
+    let mut n = 0usize;
+    for s in data {
+        acc += s;
+        n += 1;
+        if n == channels {
+            out.push(acc * inv);
+            acc = 0.0;
+            n = 0;
+        }
+    }
+    // Trailing partial frame (should not happen with well-formed buffers).
+    if n > 0 {
+        out.push(acc / n as f32);
     }
 }
 
@@ -219,7 +245,7 @@ fn send_cmd(tx_slot: &RecorderTx, cmd: RecCmd) -> Result<(), String> {
     tx.send(cmd).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn recorder_start(
     app: AppHandle,
     song_dir: String,
@@ -244,9 +270,23 @@ pub fn set_mic_device(app: AppHandle, name: Option<String>) -> Result<(), String
     crate::settings::save_settings(&app, &settings)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn recorder_stop(tx: State<'_, RecorderTx>) -> Result<String, String> {
     let (resp, rx) = mpsc::channel();
     send_cmd(tx.inner(), RecCmd::Stop { resp })?;
     rx.recv().map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::downmix;
+
+    #[test]
+    fn downmix_reuses_buffer_and_averages() {
+        let mut out = Vec::with_capacity(8);
+        downmix([1.0, 0.0, 0.5, 0.5].into_iter(), 2, &mut out);
+        assert_eq!(out, vec![0.5, 0.5]);
+        downmix([0.25].into_iter(), 1, &mut out);
+        assert_eq!(out, vec![0.25]);
+    }
 }

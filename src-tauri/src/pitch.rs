@@ -1,19 +1,21 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use aligner_pipeline::AudioBuffer;
 use parking_lot::Mutex;
 use pitch_detection::detector::yin::YINDetector;
 use pitch_detection::detector::PitchDetector;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::audio::load_wav_mono;
 use crate::recorder::MicBufferState;
 
 const WINDOW_SAMPLES: usize = 1024;
 const HOP_MS: u64 = 10;
 const POWER_THRESHOLD: f32 = 5.0;
 const CLARITY_THRESHOLD: f32 = 0.7;
+const ANALYZER_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PitchPoint {
@@ -25,35 +27,25 @@ pub fn hz_to_midi(hz: f32) -> Option<f32> {
     if hz <= 0.0 { None } else { Some(69.0 + 12.0 * (hz / 440.0).log2()) }
 }
 
-/// Precompute reference pitch contour from vocals.mp3 → pitch.json.
-pub async fn precompute_reference_pitch(dir: &Path) -> Result<(), String> {
-    let vocals = dir.join("vocals.mp3");
-    if !vocals.exists() {
-        return Err("vocals.mp3 not found".into());
-    }
-    let out_path = dir.join("pitch.json");
-    if out_path.exists() {
-        return Ok(());
-    }
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let (samples, sr) = load_wav_mono(&dir.join("vocals.mp3"))?;
-        let points = analyze_contour(&samples, sr);
-        let json = serde_json::to_string(&points).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("pitch.json"), json).map_err(|e| e.to_string())?;
-        Ok::<_, String>(())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    Ok(())
+/// True when the song already has a cached reference contour (pitch.json).
+pub fn has_reference_pitch(dir: &Path) -> bool {
+    dir.join("pitch.json").exists()
+}
+
+/// Compute the reference pitch contour from already-decoded vocals → pitch.json.
+/// CPU-bound: call it from a blocking thread.
+pub fn write_reference_pitch(dir: &Path, vocals: &AudioBuffer) -> Result<(), String> {
+    let points = analyze_contour(&vocals.samples, vocals.sample_rate);
+    let json = serde_json::to_string(&points).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("pitch.json"), json).map_err(|e| e.to_string())
 }
 
 fn analyze_contour(samples: &[f32], sample_rate: u32) -> Vec<PitchPoint> {
     let hop = (sample_rate as u64 * HOP_MS / 1000) as usize;
     let win = WINDOW_SAMPLES;
-    if samples.len() < win { return Vec::new(); }
+    if samples.len() < win || hop == 0 { return Vec::new(); }
     let mut detector = YINDetector::new(win, win / 2);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity((samples.len() - win) / hop + 1);
     let mut pos = 0usize;
     while pos + win <= samples.len() {
         let slice = &samples[pos..pos + win];
@@ -68,13 +60,26 @@ fn analyze_contour(samples: &[f32], sample_rate: u32) -> Vec<PitchPoint> {
     out
 }
 
+/// One scoring target: a word of words.json with its reference note.
+#[derive(Debug, Clone, Copy)]
+pub struct WordTarget {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Median reference note over the word, `None` when the contour has no
+    /// voiced frame inside it (the word is then never scored).
+    pub ref_midi: Option<f32>,
+}
+
 /// Active pitch-analyzer worker state.
 #[derive(Default)]
 pub struct PitchRuntime {
-    pub reference: Vec<PitchPoint>,
     pub active: bool,
     pub song_start_epoch_ms: u64,
-    pub word_boundaries: Vec<(u64, u64)>, // (start_ms, end_ms) per word in song timeline
+    /// Bumped on every `pitch_start`: an analyzer thread exits as soon as it
+    /// sees a newer generation, so a second start never leaves two running.
+    pub generation: u64,
+    /// words.json in order (index = `word_idx` sent to the frontend).
+    pub words: Vec<WordTarget>,
 }
 
 pub type PitchState = Arc<Mutex<PitchRuntime>>;
@@ -84,8 +89,8 @@ pub fn init(app: &AppHandle) {
     app.manage(state);
 }
 
-#[tauri::command]
-pub async fn pitch_start(
+#[tauri::command(async)]
+pub fn pitch_start(
     app: AppHandle,
     song_dir: String,
     state: State<'_, PitchState>,
@@ -121,21 +126,34 @@ pub async fn pitch_start(
             })
             .unwrap_or_default()
     };
+    // Reference notes never change during a session: resolve them once here
+    // instead of re-filtering the whole contour on every analyzer tick.
+    let words: Vec<WordTarget> = word_boundaries
+        .iter()
+        .map(|&(start_ms, end_ms)| WordTarget {
+            start_ms,
+            end_ms,
+            ref_midi: median_hz_in_range(&reference, start_ms, end_ms).and_then(hz_to_midi),
+        })
+        .collect();
 
-    {
+    let generation = {
         let mut s = state.lock();
-        s.reference = reference;
-        s.word_boundaries = word_boundaries;
+        s.words = words;
         s.active = true;
         s.song_start_epoch_ms = now_ms();
-    }
+        s.generation = s.generation.wrapping_add(1);
+        s.generation
+    };
 
     let state_clone = state.inner().clone();
     let mic_clone = mic.inner().clone();
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        run_analyzer(app_clone, state_clone, mic_clone).await;
-    });
+    // YIN keeps !Send scratch buffers, and the loop is CPU work: give it its own
+    // thread rather than an async task.
+    std::thread::Builder::new()
+        .name("pitch-analyzer".into())
+        .spawn(move || run_analyzer(app, state_clone, mic_clone, generation))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -154,29 +172,29 @@ pub fn pitch_sync(state: State<'_, PitchState>, elapsed_ms: u64) -> Result<(), S
     Ok(())
 }
 
-async fn run_analyzer(app: AppHandle, state: PitchState, mic: MicBufferState) {
-    let mut last_word_reported: i64 = -1;
+fn run_analyzer(app: AppHandle, state: PitchState, mic: MicBufferState, generation: u64) {
+    let mut detector = YINDetector::new(WINDOW_SAMPLES, WINDOW_SAMPLES / 2);
+    let mut window: Vec<f32> = Vec::new();
+    let mut hz_vals: Vec<f32> = Vec::new();
     loop {
         {
-            if !state.lock().active { break; }
+            let s = state.lock();
+            if !s.active || s.generation != generation { break; }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::thread::sleep(ANALYZER_TICK);
 
-        // Snapshot mic
-        let (samples, sr) = {
+        // Snapshot only the last ~200 ms of mic audio (not the whole ring buffer)
+        let sr = {
             let b = mic.lock();
-            (b.samples.clone(), b.sample_rate)
+            let take_n = ((b.sample_rate as usize) / 5).min(b.samples.len());
+            window.clear();
+            window.extend_from_slice(&b.samples[b.samples.len() - take_n..]);
+            b.sample_rate
         };
-        if samples.is_empty() || sr == 0 { continue; }
-
-        // Take last ~200ms for pitch
-        let take_n = ((sr as usize) / 5).min(samples.len());
-        if take_n < WINDOW_SAMPLES { continue; }
-        let window = &samples[samples.len() - take_n..];
+        if window.len() < WINDOW_SAMPLES || sr == 0 { continue; }
 
         // Median pitch over small hops
-        let mut hz_vals = Vec::new();
-        let mut detector = YINDetector::new(WINDOW_SAMPLES, WINDOW_SAMPLES / 2);
+        hz_vals.clear();
         let mut i = 0;
         while i + WINDOW_SAMPLES <= window.len() {
             if let Some(p) = detector.get_pitch(
@@ -190,29 +208,17 @@ async fn run_analyzer(app: AppHandle, state: PitchState, mic: MicBufferState) {
             i += WINDOW_SAMPLES / 2;
         }
         if hz_vals.is_empty() { continue; }
-        hz_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        hz_vals.sort_by(|a, b| a.total_cmp(b));
         let sung_hz = hz_vals[hz_vals.len() / 2];
         let sung_midi = match hz_to_midi(sung_hz) { Some(m) => m, None => continue };
 
         // Figure out current word from song timeline
-        let (elapsed_ms, reference, boundaries) = {
+        let target = {
             let s = state.lock();
-            (
-                now_ms().saturating_sub(s.song_start_epoch_ms),
-                s.reference.clone(),
-                s.word_boundaries.clone(),
-            )
+            let elapsed_ms = now_ms().saturating_sub(s.song_start_epoch_ms);
+            current_word(&s.words, elapsed_ms)
         };
-        let word_idx = boundaries
-            .iter()
-            .position(|(st, en)| elapsed_ms >= *st && elapsed_ms < *en);
-        let Some(word_idx) = word_idx else { continue };
-        if word_idx as i64 == last_word_reported { /* allow re-scoring */ }
-
-        let (ws, we) = boundaries[word_idx];
-        let ref_hz = median_hz_in_range(&reference, ws, we);
-        let Some(ref_hz) = ref_hz else { continue };
-        let ref_midi = match hz_to_midi(ref_hz) { Some(m) => m, None => continue };
+        let Some((word_idx, ref_midi)) = target else { continue };
         let diff = (sung_midi - ref_midi).abs();
 
         // Fold octave errors
@@ -235,18 +241,33 @@ async fn run_analyzer(app: AppHandle, state: PitchState, mic: MicBufferState) {
                 "note_diff": folded,
             }),
         );
-        last_word_reported = word_idx as i64;
     }
 }
 
+/// Word being sung at `elapsed_ms` with its reference note. Word starts are
+/// monotonic (aligner guarantee), so a binary search replaces the linear scan.
+fn current_word(words: &[WordTarget], elapsed_ms: u64) -> Option<(usize, f32)> {
+    let idx = words.partition_point(|w| w.start_ms <= elapsed_ms).checked_sub(1)?;
+    let w = words[idx];
+    if elapsed_ms >= w.end_ms {
+        return None;
+    }
+    w.ref_midi.map(|m| (idx, m))
+}
+
+/// Median reference frequency in `[start_ms, end_ms)`. The contour is sorted by
+/// time, so the range is located by binary search.
 fn median_hz_in_range(ref_points: &[PitchPoint], start_ms: u64, end_ms: u64) -> Option<f32> {
+    let lo = ref_points.partition_point(|p| p.time_ms < start_ms);
+    let hi = ref_points.partition_point(|p| p.time_ms < end_ms);
     let mut hz: Vec<f32> = ref_points
+        .get(lo..hi.max(lo))?
         .iter()
-        .filter(|p| p.time_ms >= start_ms && p.time_ms < end_ms && p.hz > 0.0)
+        .filter(|p| p.hz > 0.0)
         .map(|p| p.hz)
         .collect();
     if hz.is_empty() { return None; }
-    hz.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    hz.sort_by(|a, b| a.total_cmp(b));
     Some(hz[hz.len() / 2])
 }
 
@@ -256,4 +277,33 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point(time_ms: u64, hz: f32) -> PitchPoint {
+        PitchPoint { time_ms, hz }
+    }
+
+    #[test]
+    fn median_uses_only_points_in_range() {
+        let pts = vec![point(0, 100.0), point(10, 200.0), point(20, 300.0), point(30, 400.0)];
+        assert_eq!(median_hz_in_range(&pts, 10, 30), Some(300.0));
+        assert_eq!(median_hz_in_range(&pts, 40, 50), None);
+    }
+
+    #[test]
+    fn current_word_finds_containing_word() {
+        let words = vec![
+            WordTarget { start_ms: 0, end_ms: 100, ref_midi: Some(60.0) },
+            WordTarget { start_ms: 200, end_ms: 300, ref_midi: Some(62.0) },
+            WordTarget { start_ms: 300, end_ms: 400, ref_midi: None },
+        ];
+        assert_eq!(current_word(&words, 50), Some((0, 60.0)));
+        assert_eq!(current_word(&words, 150), None);
+        assert_eq!(current_word(&words, 250), Some((1, 62.0)));
+        assert_eq!(current_word(&words, 350), None);
+    }
 }

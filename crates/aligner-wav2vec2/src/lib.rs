@@ -114,6 +114,24 @@ impl Wav2vecAligner {
         lyrics: &str,
         time_offset_sec: f64,
     ) -> Result<Vec<AlignedWord>, AlignError> {
+        self.align_owned(
+            AudioBuffer {
+                samples: vocals.samples.clone(),
+                sample_rate: vocals.sample_rate,
+            },
+            lyrics,
+            time_offset_sec,
+        )
+    }
+
+    /// Same as [`Self::align`], but takes ownership of the buffer so
+    /// preprocessing runs in place instead of on a full copy of the song.
+    pub fn align_owned(
+        &mut self,
+        vocals: AudioBuffer,
+        lyrics: &str,
+        time_offset_sec: f64,
+    ) -> Result<Vec<AlignedWord>, AlignError> {
         if vocals.sample_rate != TARGET_SAMPLE_RATE {
             return Err(AlignError::BadSampleRate {
                 expected: TARGET_SAMPLE_RATE,
@@ -124,7 +142,7 @@ impl Wav2vecAligner {
             return Ok(Vec::new());
         }
 
-        let mut work = vocals.samples.clone();
+        let mut work = vocals.samples;
         highpass_biquad(&mut work, vocals.sample_rate, self.config.highpass_hz);
         rms_normalize(&mut work, self.config.rms_target_dbfs);
 
@@ -189,7 +207,9 @@ impl Wav2vecAligner {
             total_chunks,
             self.config.chunk_seconds,
         );
-        let mut acc: Option<Array2<f32>> = None;
+        // Collect per-chunk logits and concatenate once at the end; growing an
+        // accumulator chunk by chunk would copy the whole matrix every time.
+        let mut parts: Vec<Array2<f32>> = Vec::with_capacity(total_chunks);
         for (idx, start) in (0..samples.len()).step_by(chunk_samples).enumerate() {
             let end = (start + chunk_samples).min(samples.len());
             if end - start < min_chunk {
@@ -211,12 +231,17 @@ impl Wav2vecAligner {
                 end,
                 logits.shape()[0],
             );
-            acc = Some(match acc {
-                None => logits,
-                Some(prev) => ndarray::concatenate![ndarray::Axis(0), prev, logits],
-            });
+            parts.push(logits);
         }
-        acc.ok_or_else(|| AlignError::Inference("no chunks produced any frames".into()))
+        match parts.len() {
+            0 => Err(AlignError::Inference("no chunks produced any frames".into())),
+            1 => Ok(parts.pop().expect("one part")),
+            _ => {
+                let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
+                ndarray::concatenate(ndarray::Axis(0), &views)
+                    .map_err(|e| AlignError::Inference(format!("concat logits: {}", e)))
+            }
+        }
     }
 }
 

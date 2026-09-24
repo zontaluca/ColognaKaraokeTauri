@@ -33,7 +33,7 @@ pub fn lyrics_to_target_ids(lyrics: &str, vocab: &Vocab) -> TargetSequence {
         let surface = raw.to_string();
         let normalised: String = raw
             .chars()
-            .filter(|c| c.is_alphabetic() || *c == '\'' || *c == '-')
+            .filter(|c| is_alignable_char(*c))
             .flat_map(|c| c.to_lowercase())
             .collect();
         if normalised.is_empty() {
@@ -59,6 +59,20 @@ pub fn lyrics_to_target_ids(lyrics: &str, vocab: &Vocab) -> TargetSequence {
     TargetSequence { ids, words }
 }
 
+fn is_alignable_char(c: char) -> bool {
+    c.is_alphabetic() || c == '\'' || c == '-'
+}
+
+/// Number of words in `text` that [`lyrics_to_target_ids`] keeps (and therefore
+/// that `align` returns). Tokens without any alignable char, such as numbers,
+/// "&" or "…", are dropped by the tokenizer, so callers mapping aligned words
+/// back to lyric lines must count with this instead of `split_whitespace`.
+pub fn count_alignable_words(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|raw| raw.chars().any(is_alignable_char))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +93,14 @@ mod tests {
         assert_eq!(seq.words[0].token_range, 0..2);
         assert_eq!(seq.words[1].word, "ciao!");
         assert_eq!(seq.words[1].token_range, 3..7);
+    }
+
+    #[test]
+    fn counts_only_tokens_the_tokenizer_keeps() {
+        let vocab = fake_vocab();
+        let line = "ciao 2 & amici … l'amore";
+        assert_eq!(count_alignable_words(line), 3);
+        assert_eq!(lyrics_to_target_ids(line, &vocab).words.len(), 3);
     }
 
     #[test]
