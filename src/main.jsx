@@ -1,13 +1,18 @@
-import React from "react";
+import React, { Suspense, lazy } from "react";
 import ReactDOM from "react-dom/client";
-import App from "./App.jsx";
-import PresentationView from "./views/PresentationView.jsx";
 import "./styles/global.css";
 
 const isPresentation = typeof window !== "undefined" && window.location.hash.startsWith("#presentation");
 
+// Each window loads only its own bundle: the presentation window doesn't need
+// the whole app (library, player, settings...) and vice versa.
+const App = lazy(() => import("./App.jsx"));
+const PresentationView = lazy(() => import("./views/PresentationView.jsx"));
+
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    {isPresentation ? <PresentationView /> : <App />}
+    <Suspense fallback={null}>
+      {isPresentation ? <PresentationView /> : <App />}
+    </Suspense>
   </React.StrictMode>
 );
