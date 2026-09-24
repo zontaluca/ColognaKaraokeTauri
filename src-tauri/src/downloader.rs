@@ -173,10 +173,14 @@ pub async fn download_audio(
         .spawn()
         .map_err(|e| e.to_string())?;
 
+    let mut last_error: Option<String> = None;
     while let Some(event) = rx.recv().await {
         match event {
             CommandEvent::Stdout(bytes) | CommandEvent::Stderr(bytes) => {
                 let line = String::from_utf8_lossy(&bytes).to_string();
+                if line.starts_with("ERROR:") {
+                    last_error = Some(line.trim().to_string());
+                }
                 if let Some(m) = PERCENT_RE.captures_iter(&line).last() {
                     if let Ok(p) = m[1].parse::<f32>() {
                         on_progress(&format!("Downloading... {:.0}%", p), (p / 100.0).clamp(0.0, 1.0));
@@ -186,7 +190,9 @@ pub async fn download_audio(
             CommandEvent::Error(err) => return Err(err),
             CommandEvent::Terminated(payload) => {
                 if payload.code.unwrap_or(-1) != 0 {
-                    return Err(format!("yt-dlp exited with code {:?}", payload.code));
+                    return Err(last_error.unwrap_or_else(|| {
+                        format!("yt-dlp exited with code {:?}", payload.code)
+                    }));
                 }
                 break;
             }
