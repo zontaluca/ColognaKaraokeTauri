@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -12,6 +12,9 @@ const COVER_GRADIENTS = [
   "linear-gradient(135deg, #FB7185, #E11D48)",
   "linear-gradient(135deg, #A78BFA, #7C3AED)",
 ];
+
+// Built once: `localeCompare` with options creates a collator per comparison.
+const TITLE_COLLATOR = new Intl.Collator("it", { sensitivity: "base" });
 
 function coverGradient(seed) {
   let h = 0;
@@ -54,8 +57,10 @@ function CloudBadge({ song }) {
 
 function LrcBadge({ song }) {
   if (!song.lrc) return null;
+  // lrc_generated: timing produced by the aligner/recognizer, not by LRCLIB.
+  const generated = Boolean(song.lrc_generated);
   return (
-    <span style={{
+    <span title={generated ? (song.lrc_generated === "asr" ? "Testo trascritto automaticamente (Parakeet)" : "Timing generato automaticamente") : undefined} style={{
       display: "inline-flex", padding: "3px 8px", borderRadius: 999,
       fontSize: 9.5, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase",
       background: song.lrc_enhanced ? CK_GRADIENT : "rgba(0,0,0,0.55)",
@@ -64,53 +69,57 @@ function LrcBadge({ song }) {
       border: song.lrc_enhanced ? "none" : "1px solid rgba(255,255,255,0.18)",
       flexShrink: 0,
     }}>
-      {song.lrc_enhanced ? "LRC Enhanced" : "LRC"}
+      {song.lrc_enhanced ? "LRC Enhanced" : "LRC"}{generated ? " · auto" : ""}
     </span>
   );
 }
 
-function TrackCard({ song, onPlay, onDelete, onReprocess }) {
-  const [hovered, setHovered] = useState(false);
-  // confirming: false | "local" | "everywhere"
+// Shared state + handlers for a library entry (used by both the grid card and
+// the list row, which only differ in layout).
+function useTrackActions(song, onDelete, onReprocess) {
+  // confirming: false | "confirm" | "choose"
   const [confirming, setConfirming] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
   const [reprocessMsg, setReprocessMsg] = useState("");
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudMsg, setCloudMsg] = useState("");
-  const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
-  const bg = coverSrc ? `url(${coverSrc}) center/cover no-repeat` : coverGradient(song._dir || "x");
+
+  // Keep on cloud, just remove local files
+  const deleteLocalOnly = async (e) => {
+    e.stopPropagation();
+    try {
+      await invoke("cloud_make_local_only", { dir: song._dir });
+      await onReprocess?.(song._dir);
+    } catch (err) { console.error("make_cloud_only failed", err); }
+    setConfirming(false);
+  };
+
+  const deleteEverywhere = async (e) => {
+    e.stopPropagation();
+    try {
+      await invoke("cloud_delete_song", { dir: song._dir });
+      await invoke("delete_song", { dir: song._dir });
+      onDelete(song._dir);
+    } catch (err) { console.error("delete everywhere failed", err); }
+    setConfirming(false);
+  };
 
   const handleDelete = async (e) => {
     e.stopPropagation();
-    if (song.cloud_synced) {
+    if (song.cloud_synced && !song.local_deleted) {
       // Synced song: first confirm, then offer local-only vs everywhere
-      if (!confirming) { setConfirming("choose"); return; }
-      if (confirming === "choose") return; // wait for sub-choice
-      if (confirming === "local") {
-        // Keep on cloud, just remove local files
-        try {
-          await invoke("cloud_make_local_only", { dir: song._dir });
-          await onReprocess?.(song._dir);
-        } catch (err) { console.error(err); }
-        setConfirming(false);
-        return;
-      }
-      if (confirming === "everywhere") {
-        try {
-          await invoke("cloud_delete_song", { dir: song._dir });
-          await invoke("delete_song", { dir: song._dir });
-          onDelete(song._dir);
-        } catch (err) { console.error(err); }
-        setConfirming(false);
-        return;
-      }
+      // (the choice buttons call deleteLocalOnly / deleteEverywhere directly).
+      if (!confirming) setConfirming("choose");
+      return;
     }
     // Not synced: normal delete
     if (!confirming) { setConfirming("confirm"); return; }
     try {
       await invoke("delete_song", { dir: song._dir });
       onDelete(song._dir);
-    } catch (err) { console.error("delete_song failed", err); }
+    } catch (err) {
+      console.error("delete_song failed", err);
+    }
   };
 
   const handleReprocess = async (e) => {
@@ -168,6 +177,23 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
       await onReprocess?.(song._dir);
     } catch (err) { setCloudMsg("Errore: " + err); }
   };
+
+  return {
+    confirming, setConfirming, reprocessing, reprocessMsg, cloudBusy, cloudMsg,
+    handleDelete, deleteLocalOnly, deleteEverywhere,
+    handleReprocess, handleCloudSync, handleCloudDownload, handleMakeCloudOnly,
+  };
+}
+
+const TrackCard = memo(function TrackCard({ song, onPlay, onDelete, onReprocess }) {
+  const [hovered, setHovered] = useState(false);
+  const {
+    confirming, setConfirming, reprocessing, reprocessMsg, cloudBusy, cloudMsg,
+    handleDelete, deleteLocalOnly, deleteEverywhere,
+    handleReprocess, handleCloudSync, handleCloudDownload, handleMakeCloudOnly,
+  } = useTrackActions(song, onDelete, onReprocess);
+  const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
+  const bg = coverSrc ? `url(${coverSrc}) center/cover no-repeat` : coverGradient(song._dir || "x");
 
   return (
     <div
@@ -235,11 +261,11 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
           {!song.local_deleted && (
             confirming === "choose" ? (
               <div style={{ display: "flex", gap: 4 }}>
-                <button onClick={(e) => { e.stopPropagation(); setConfirming("local"); handleDelete(e); }}
+                <button onClick={deleteLocalOnly}
                   style={{ all: "unset", cursor: "pointer", fontSize: 10, padding: "4px 8px", borderRadius: 6, background: "rgba(255,183,112,0.15)", color: "#FFB370", border: "1px solid rgba(255,183,112,0.3)" }}>
                   Solo locale
                 </button>
-                <button onClick={(e) => { e.stopPropagation(); setConfirming("everywhere"); handleDelete(e); }}
+                <button onClick={deleteEverywhere}
                   style={{ all: "unset", cursor: "pointer", fontSize: 10, padding: "4px 8px", borderRadius: 6, background: "rgba(242,61,109,0.15)", color: "#F23D6D", border: "1px solid rgba(242,61,109,0.3)" }}>
                   Ovunque
                 </button>
@@ -308,7 +334,7 @@ function TrackCard({ song, onPlay, onDelete, onReprocess }) {
       </div>
     </div>
   );
-}
+});
 
 const smallBtnStyle = {
   all: "unset", cursor: "pointer",
@@ -319,103 +345,15 @@ const smallBtnStyle = {
   border: "1px solid rgba(255,255,255,0.06)",
 };
 
-function TrackRow({ song, onPlay, onDelete, onReprocess }) {
+const TrackRow = memo(function TrackRow({ song, onPlay, onDelete, onReprocess }) {
   const [hovered, setHovered] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-  const [reprocessing, setReprocessing] = useState(false);
-  const [reprocessMsg, setReprocessMsg] = useState("");
-  const [cloudBusy, setCloudBusy] = useState(false);
-  const [cloudMsg, setCloudMsg] = useState("");
+  const {
+    confirming, setConfirming, reprocessing, reprocessMsg, cloudBusy, cloudMsg,
+    handleDelete, deleteLocalOnly, deleteEverywhere,
+    handleReprocess, handleCloudSync, handleCloudDownload, handleMakeCloudOnly,
+  } = useTrackActions(song, onDelete, onReprocess);
   const coverSrc = song.cover_path ? convertFileSrc(song.cover_path) : null;
   const bg = coverSrc ? `url(${coverSrc}) center/cover no-repeat` : coverGradient(song._dir || "x");
-
-  const handleDelete = async (e) => {
-    e.stopPropagation();
-    if (song.cloud_synced && !song.local_deleted) {
-      if (!confirming) { setConfirming("choose"); return; }
-      if (confirming === "choose") return;
-      if (confirming === "local") {
-        try {
-          await invoke("cloud_make_local_only", { dir: song._dir });
-          await onReprocess?.(song._dir);
-        } catch (err) { console.error("make_cloud_only failed", err); }
-        setConfirming(false);
-        return;
-      }
-      if (confirming === "everywhere") {
-        try {
-          await invoke("cloud_delete_song", { dir: song._dir });
-          await invoke("delete_song", { dir: song._dir });
-          onDelete(song._dir);
-        } catch (err) { console.error("delete everywhere failed", err); }
-        setConfirming(false);
-        return;
-      }
-    }
-    if (!confirming) { setConfirming("confirm"); return; }
-    try {
-      await invoke("delete_song", { dir: song._dir });
-      onDelete(song._dir);
-    } catch (err) {
-      console.error("delete_song failed", err);
-    }
-  };
-
-  const handleReprocess = async (e) => {
-    e.stopPropagation();
-    if (reprocessing) return;
-    setReprocessing(true);
-    setReprocessMsg("Starting…");
-    let unlisten;
-    try {
-      unlisten = await listen("karaoke://reprocess-progress", (ev) => {
-        const { message, status } = ev.payload || {};
-        if (status === "error") setReprocessMsg("Error: " + message);
-        else setReprocessMsg(message || "");
-      });
-      await invoke("reprocess_song", { dir: song._dir });
-      setReprocessMsg("Done!");
-      await onReprocess?.(song._dir);
-    } catch (err) {
-      setReprocessMsg("Error: " + err);
-    } finally {
-      unlisten?.();
-      setTimeout(() => { setReprocessing(false); setReprocessMsg(""); }, 1500);
-    }
-  };
-
-  const handleCloudSync = async (e) => {
-    e.stopPropagation();
-    if (cloudBusy) return;
-    setCloudBusy(true); setCloudMsg("Sync...");
-    try {
-      await invoke("cloud_sync_song", { dir: song._dir });
-      setCloudMsg("Synced!");
-      await onReprocess?.(song._dir);
-    } catch (err) { setCloudMsg("Errore: " + err); }
-    finally { setTimeout(() => { setCloudBusy(false); setCloudMsg(""); }, 2000); }
-  };
-
-  const handleCloudDownload = async (e) => {
-    e.stopPropagation();
-    if (cloudBusy) return;
-    setCloudBusy(true); setCloudMsg("Download...");
-    try {
-      await invoke("cloud_download_song", { dir: song._dir });
-      setCloudMsg("Scaricato!");
-      await onReprocess?.(song._dir);
-    } catch (err) { setCloudMsg("Errore: " + err); }
-    finally { setTimeout(() => { setCloudBusy(false); setCloudMsg(""); }, 2000); }
-  };
-
-  const handleMakeCloudOnly = async (e) => {
-    e.stopPropagation();
-    if (!song.cloud_synced) { setCloudMsg("Prima sincronizza!"); return; }
-    try {
-      await invoke("cloud_make_local_only", { dir: song._dir });
-      await onReprocess?.(song._dir);
-    } catch (err) { setCloudMsg("Errore: " + err); }
-  };
 
   return (
     <div
@@ -518,11 +456,11 @@ function TrackRow({ song, onPlay, onDelete, onReprocess }) {
         {!song.local_deleted && (
           confirming === "choose" ? (
             <>
-              <button onClick={(e) => { e.stopPropagation(); setConfirming("local"); handleDelete(e); }}
+              <button onClick={deleteLocalOnly}
                 style={{ all:"unset", cursor:"pointer", fontSize:10.5, padding:"3px 8px", borderRadius:5, background:"rgba(255,183,112,0.15)", color:"#FFB370", border:"1px solid rgba(255,183,112,0.3)" }}>
                 Solo locale
               </button>
-              <button onClick={(e) => { e.stopPropagation(); setConfirming("everywhere"); handleDelete(e); }}
+              <button onClick={deleteEverywhere}
                 style={{ all:"unset", cursor:"pointer", fontSize:10.5, padding:"3px 8px", borderRadius:5, background:"rgba(242,61,109,0.15)", color:"#F23D6D", border:"1px solid rgba(242,61,109,0.3)" }}>
                 Ovunque
               </button>
@@ -551,7 +489,7 @@ function TrackRow({ song, onPlay, onDelete, onReprocess }) {
       </div>
     </div>
   );
-}
+});
 
 function AddTrackCard({ onAdd }) {
   const [hovered, setHovered] = useState(false);
@@ -714,10 +652,18 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
     return list;
   }, [songs, q, filter]);
 
+  const stats = useMemo(() => {
+    let wordSynced = 0, lineSynced = 0, onMega = 0;
+    for (const s of songs) {
+      if (s.lrc_enhanced) wordSynced++;
+      else if (s.lrc) lineSynced++;
+      if (s.cloud_synced || s.local_deleted) onMega++;
+    }
+    return { wordSynced, lineSynced, onMega };
+  }, [songs]);
+
   const groups = useMemo(() => {
-    const sorted = [...filtered].sort((a, b) =>
-      (a.title || "").localeCompare(b.title || "", "it", { sensitivity: "base" })
-    );
+    const sorted = [...filtered].sort((a, b) => TITLE_COLLATOR.compare(a.title || "", b.title || ""));
     const map = {};
     for (const s of sorted) {
       const key = letterKey(s.title);
@@ -742,7 +688,7 @@ export default function Library({ songs, onPlay, onDelete, onRefresh, onAddSong,
             Songs
           </h1>
           <div style={{ marginTop: 8, fontSize: 13.5, color: "rgba(237,233,255,0.55)", fontWeight: 500 }}>
-            {songs.length} tracks · {songs.filter(s => s.lrc_enhanced).length} word-synced · {songs.filter(s => s.lrc && !s.lrc_enhanced).length} line-synced{songs.filter(s => s.cloud_synced || s.local_deleted).length > 0 ? ` · ${songs.filter(s => s.cloud_synced || s.local_deleted).length} su MEGA` : ""}
+            {songs.length} tracks · {stats.wordSynced} word-synced · {stats.lineSynced} line-synced{stats.onMega > 0 ? ` · ${stats.onMega} su MEGA` : ""}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>

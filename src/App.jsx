@@ -185,10 +185,11 @@ export default function App() {
     setView("player");
   }, []);
 
-  const deleteSong = (dir) => {
+  // Stable callbacks: they are passed to every (memoized) library row.
+  const deleteSong = useCallback((dir) => {
     setSongs((prev) => prev.filter((s) => s._dir !== dir));
-    if (currentSong?._dir === dir) setCurrentSong(null);
-  };
+    setCurrentSong((prev) => (prev?._dir === dir ? null : prev));
+  }, []);
 
   const onJobDone        = useCallback(() => { refreshLibrary(); }, [refreshLibrary]);
   const onCloudSyncDone  = useCallback(() => { refreshLibrary(); }, [refreshLibrary]);
@@ -197,14 +198,15 @@ export default function App() {
     try {
       const list = await invoke("scan_library");
       setSongs(list);
-      if (currentSong) {
-        const updated = list.find((s) => s._dir === currentSong._dir);
-        if (updated) setCurrentSong(updated);
-      }
+      setCurrentSong((prev) => {
+        if (!prev) return prev;
+        const updated = list.find((s) => s._dir === prev._dir);
+        return updated || prev;
+      });
     } catch (e) {
       console.error("refreshCurrentSong failed", e);
     }
-  }, [currentSong]);
+  }, []);
 
   // Persist active queue whenever it changes
   useEffect(() => {

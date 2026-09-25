@@ -55,14 +55,18 @@ pub fn forced_align(
         .collect();
 
     let neg_inf = f32::NEG_INFINITY;
-    let mut alpha = vec![neg_inf; t * m];
+    // Only the previous time step is needed to extend the lattice, so alpha is
+    // kept as two rolling rows (O(M) instead of O(T*M) f32). Backpointers still
+    // need the full lattice for the traceback, but at one byte per cell.
+    let mut prev_alpha = vec![neg_inf; m];
+    let mut cur_alpha = vec![neg_inf; m];
     let mut back = vec![0u8; t * m]; // 0=stay, 1=prev, 2=skip
     let idx = |row: usize, col: usize| row * m + col;
 
     // Initialise t=0: can only start at ext[0]=blank or ext[1]=targets[0].
-    alpha[idx(0, 0)] = log_probs[[0, blank_id as usize]];
+    prev_alpha[0] = log_probs[[0, blank_id as usize]];
     if m >= 2 {
-        alpha[idx(0, 1)] = log_probs[[0, ext[1] as usize]];
+        prev_alpha[1] = log_probs[[0, ext[1] as usize]];
     }
 
     for time in 1..t {
@@ -71,17 +75,19 @@ pub fn forced_align(
         // and `s <= 2*time + 1` (typical CTC constraints).
         let lo = m.saturating_sub(2 * (t - time));
         let hi = (2 * time + 2).min(m);
+        let row = log_probs.row(time);
 
+        cur_alpha.fill(neg_inf);
         for s in lo..hi {
-            let emit = log_probs[[time, ext[s] as usize]];
+            let emit = row[ext[s] as usize];
             // Three predecessors:
             //  - stay (alpha[t-1][s])
             //  - prev (alpha[t-1][s-1])
             //  - skip (alpha[t-1][s-2]) if ext[s] != blank and ext[s] != ext[s-2]
-            let stay = alpha[idx(time - 1, s)];
-            let prev = if s >= 1 { alpha[idx(time - 1, s - 1)] } else { neg_inf };
+            let stay = prev_alpha[s];
+            let prev = if s >= 1 { prev_alpha[s - 1] } else { neg_inf };
             let skip = if s >= 2 && ext[s] != blank_id && ext[s] != ext[s - 2] {
-                alpha[idx(time - 1, s - 2)]
+                prev_alpha[s - 2]
             } else {
                 neg_inf
             };
@@ -90,16 +96,18 @@ pub fn forced_align(
             if best == neg_inf {
                 continue;
             }
-            alpha[idx(time, s)] = best + emit;
+            cur_alpha[s] = best + emit;
             back[idx(time, s)] = choice;
         }
+        std::mem::swap(&mut prev_alpha, &mut cur_alpha);
     }
 
     // Pick best terminal state — must be one of the last two (final blank or final token).
-    let final_a = alpha[idx(t - 1, m - 1)];
-    let final_b = if m >= 2 { alpha[idx(t - 1, m - 2)] } else { neg_inf };
+    // After the loop `prev_alpha` holds the last time step.
+    let final_a = prev_alpha[m - 1];
+    let final_b = if m >= 2 { prev_alpha[m - 2] } else { neg_inf };
     let mut s = if final_a >= final_b { m - 1 } else { m - 2 };
-    if alpha[idx(t - 1, s)] == neg_inf {
+    if prev_alpha[s] == neg_inf {
         return Err(AlignError::Ctc(
             "forced alignment failed: no valid terminal path".into(),
         ));

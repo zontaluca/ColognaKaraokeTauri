@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
+import { memo, useEffect, useMemo, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { listen, emit } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
+import { useTauriEvent } from "../hooks/useTauriEvent.js";
 
 const CK_GRADIENT = "linear-gradient(135deg, #FFB370 0%, #FF6B5A 40%, #F23D6D 100%)";
 
@@ -96,6 +97,86 @@ function Avatar({ name }) {
   );
 }
 
+const FS_CURRENT = "clamp(32px, 6.5vmin, 120px)";
+const FS_ADJACENT = "clamp(18px, 3vmin, 56px)";
+const FS_FAR = "clamp(14px, 2.3vmin, 44px)";
+
+// One lyric line. Memoized: while singing only the current line changes on each
+// word, and only the few lines around it change when the line advances.
+// relation: "past" | "prev" | "current" | "next" | "future" (vs. the current line)
+const LyricLine = memo(function LyricLine({ text, relation, words, wordIdx, wordStatuses, lineRef }) {
+  const isCurrent = relation === "current";
+  const isPast = relation === "past" || relation === "prev";
+  const isAdjacent = relation === "prev" || relation === "next";
+  return (
+    <div ref={lineRef} style={{
+      textAlign: "center", padding: "10px 0",
+      fontFamily: "var(--font-display)",
+      fontSize: isCurrent ? FS_CURRENT : isAdjacent ? FS_ADJACENT : FS_FAR,
+      fontWeight: isCurrent ? 700 : 500,
+      letterSpacing: isCurrent ? "-0.035em" : "-0.02em",
+      lineHeight: 1.15,
+      color: isPast ? "rgba(237,233,255,0.25)" : isCurrent ? "#FFF" : (relation === "next" ? "rgba(237,233,255,0.35)" : "rgba(237,233,255,0.2)"),
+      transition: "all 200ms ease",
+      position: "relative",
+    }}>
+      {isCurrent && words ? (
+        <>
+          {words.map((w, j) => {
+            const lit = j < wordIdx;
+            const active = j === wordIdx;
+            // Score ticks are keyed by the word's index in words.json (gi).
+            const scoreStatus = wordStatuses?.[w.gi];
+            return (
+              <span key={j} style={{
+                display: "inline-block", marginRight: "0.32em",
+                color: lit ? "#FFF" : active ? "#FF9070" : "rgba(237,233,255,0.35)",
+                textShadow: lit ? "0 0 24px rgba(255,255,255,0.3)" : active ? "0 0 18px rgba(255,144,112,0.6)" : "none",
+                transition: "color 200ms ease, text-shadow 200ms ease",
+                transform: active ? "translateY(-2px)" : "none",
+                borderBottom: scoreStatus === "hit" ? "2px solid #22D3A4" : scoreStatus === "partial" ? "2px solid #FFB370" : scoreStatus === "miss" ? "2px solid #F23D6D" : "2px solid transparent",
+              }}>{w.word}</span>
+            );
+          })}
+        </>
+      ) : text}
+    </div>
+  );
+});
+
+// Waveform scrubber. Static per song (progress is driven imperatively through
+// the --progress CSS variable), so it never needs to re-render during playback.
+const Waveform = memo(function Waveform({ bars, waveformRef, onSeek }) {
+  return (
+    <div
+      ref={waveformRef}
+      className="waveform"
+      onClick={e => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        onSeek((e.clientX - rect.left) / rect.width);
+      }}
+      style={{ flex: 1, height: 36, display: "flex", alignItems: "center", gap: 2, cursor: "pointer", position: "relative", "--progress": 0 }}
+    >
+      {bars.map((h, i) => (
+        <div key={i} className="bar" style={{ height: `${h}%` }}/>
+      ))}
+      <div className="waveform-played" aria-hidden="true">
+        {bars.map((h, i) => (
+          <div key={i} className="bar" style={{ height: `${h}%` }}/>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+function lineRelation(i, currentIdx) {
+  if (i === currentIdx) return "current";
+  if (i === currentIdx - 1) return "prev";
+  if (i < currentIdx) return "past";
+  if (i === currentIdx + 1) return "next";
+  return "future";
+}
+
 const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, onPresentOpenChange, onSongEnd, readyEntry, onConfirmNext, onStopQueue }, ref) {
   const audioRef = useRef(null);
   const waveformRef = useRef(null);
@@ -143,16 +224,19 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     if (!wordTimestamps || lrcLines.length === 0) return null;
     const buckets = lrcLines.map(() => []);
     const hasLineField = wordTimestamps.some(w => typeof w.line === "number");
+    // gi = index in words.json: the pitch analyzer reports score ticks by it.
     if (hasLineField) {
-      for (const w of wordTimestamps) {
-        if (typeof w.line === "number" && buckets[w.line]) buckets[w.line].push(w);
+      for (let gi = 0; gi < wordTimestamps.length; gi++) {
+        const w = wordTimestamps[gi];
+        if (typeof w.line === "number" && buckets[w.line]) buckets[w.line].push({ ...w, gi });
       }
     } else {
-      for (const w of wordTimestamps) {
+      for (let gi = 0; gi < wordTimestamps.length; gi++) {
+        const w = wordTimestamps[gi];
         for (let i = 0; i < lrcLines.length; i++) {
           const start = lrcLines[i].ts_ms;
           const end = lrcLines[i + 1]?.ts_ms ?? (start + 8000);
-          if (w.start_ms >= start && w.start_ms < end) { buckets[i].push(w); break; }
+          if (w.start_ms >= start && w.start_ms < end) { buckets[i].push({ ...w, gi }); break; }
         }
       }
     }
@@ -180,6 +264,38 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     }
     return result;
   }, [effectiveWordsByLine, lrcLines]);
+
+  // Words per line, for the proportional highlight used without word timestamps
+  // (computed once instead of splitting the line text on every frame).
+  const lineWordCounts = useMemo(() => lrcLines.map(l => l.text.trim().split(/\s+/).length), [lrcLines]);
+
+  // Active [line, word] at offset-corrected song time `effectiveTMs`.
+  // Shared by the playback loop and by seeking.
+  const computePosition = useCallback((effectiveTMs) => {
+    let newLine = -1;
+    for (let i = 0; i < lrcLines.length; i++) {
+      const act = lineActivations[i] ?? lrcLines[i].ts_ms;
+      if (act <= effectiveTMs) newLine = i; else break;
+    }
+    let newWord = -1;
+    if (newLine >= 0) {
+      if (effectiveWordsByLine && effectiveWordsByLine[newLine]?.length > 0) {
+        const arr = effectiveWordsByLine[newLine];
+        for (let i = 0; i < arr.length; i++) {
+          if (arr[i].start_ms <= effectiveTMs) newWord = i; else break;
+        }
+      } else {
+        const line = lrcLines[newLine];
+        const wordCount = lineWordCounts[newLine];
+        const lineStart = line.ts_ms;
+        const lineEnd = lrcLines[newLine + 1]?.ts_ms ?? (lineStart + 3000);
+        const elapsed = effectiveTMs - lineStart;
+        const dur = Math.max(1, lineEnd - lineStart);
+        newWord = Math.min(Math.max(Math.floor((elapsed / dur) * wordCount), 0), wordCount - 1);
+      }
+    }
+    return [newLine, newWord];
+  }, [lrcLines, lineActivations, effectiveWordsByLine, lineWordCounts]);
 
   useEffect(() => {
     const offset = typeof song?.lrc_offset_sec === "number" ? song.lrc_offset_sec : 0;
@@ -274,30 +390,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     if (waveformRef.current && duration > 0) {
       waveformRef.current.style.setProperty("--progress", String(t / duration));
     }
-    let newLine = -1;
-    if (synced) {
-      for (let i = 0; i < lrcLines.length; i++) {
-        const act = lineActivations[i] ?? lrcLines[i].ts_ms;
-        if (act <= effectiveTMs) newLine = i; else break;
-      }
-    }
-    let newWord = -1;
-    if (newLine >= 0) {
-      if (effectiveWordsByLine && effectiveWordsByLine[newLine]?.length > 0) {
-        const arr = effectiveWordsByLine[newLine];
-        for (let i = 0; i < arr.length; i++) {
-          if (arr[i].start_ms <= effectiveTMs) newWord = i; else break;
-        }
-      } else {
-        const line = lrcLines[newLine];
-        const words = line.text.trim().split(/\s+/);
-        const lineStart = line.ts_ms;
-        const lineEnd = lrcLines[newLine + 1]?.ts_ms ?? (lineStart + 3000);
-        const elapsed = effectiveTMs - lineStart;
-        const dur = Math.max(1, lineEnd - lineStart);
-        newWord = Math.min(Math.max(Math.floor((elapsed / dur) * words.length), 0), words.length - 1);
-      }
-    }
+    const [newLine, newWord] = synced ? computePosition(effectiveTMs) : [-1, -1];
     setCurrentIdx(prev => prev !== newLine ? newLine : prev);
     setWordIdx(prev => prev !== newWord ? newWord : prev);
     if (synced && lrcLines.length > 0) {
@@ -313,7 +406,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
       setDisplayTime(t);
     }
     rafRef.current = requestAnimationFrame(tick);
-  }, [synced, lrcLines, effectiveWordsByLine, lineActivations, duration, lrcOffset]);
+  }, [synced, lrcLines, lineActivations, duration, lrcOffset, computePosition]);
 
   useEffect(() => {
     if (playing) { rafRef.current = requestAnimationFrame(tick); return () => cancelAnimationFrame(rafRef.current); }
@@ -326,7 +419,9 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     const a = audioRef.current;
     if (!a) return;
     const onDur = () => setDuration(a.duration || song?.duration_sec || 0);
-    const onEnd = () => { setPlaying(false); if (challenge && sessionId) endChallenge(); onSongEnd?.(); };
+    // endChallenge goes through a ref: this listener is registered once per
+    // session, and a direct call would read the score from that stale render.
+    const onEnd = () => { setPlaying(false); if (challenge && sessionId) endChallengeRef.current?.(); onSongEnd?.(); };
     a.addEventListener("loadedmetadata", onDur);
     a.addEventListener("ended", onEnd);
     return () => { a.removeEventListener("loadedmetadata", onDur); a.removeEventListener("ended", onEnd); };
@@ -350,25 +445,18 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     return () => a.removeEventListener("timeupdate", onTimeUpdate);
   }, [challenge, sessionId]);
 
-  useEffect(() => {
-    if (!challenge) return;
-    let unlisten;
-    (async () => {
-      unlisten = await listen("karaoke://score-tick", (ev) => {
-        const { word_idx, status } = ev.payload || {};
-        if (typeof word_idx !== "number") return;
-        setWordStatuses(prev => ({ ...prev, [word_idx]: status }));
-        setScoreState(prev => {
-          const next = { ...prev };
-          if (status === "hit") next.hits += 1;
-          else if (status === "partial") next.partials += 1;
-          else next.misses += 1;
-          return next;
-        });
-      });
-    })();
-    return () => unlisten && unlisten();
-  }, [challenge]);
+  useTauriEvent("karaoke://score-tick", (ev) => {
+    const { word_idx, status } = ev.payload || {};
+    if (typeof word_idx !== "number") return;
+    setWordStatuses(prev => ({ ...prev, [word_idx]: status }));
+    setScoreState(prev => {
+      const next = { ...prev };
+      if (status === "hit") next.hits += 1;
+      else if (status === "partial") next.partials += 1;
+      else next.misses += 1;
+      return next;
+    });
+  }, challenge);
 
   // Keep ref current so the presentation-ready handler always has fresh data
   useEffect(() => {
@@ -385,30 +473,18 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
   }, [song, lrcLines, effectiveWordsByLine]);
 
   // Re-send init when the presentation window signals it is ready (registered once — reads ref)
-  useEffect(() => {
-    let unlisten;
-    (async () => {
-      unlisten = await listen("karaoke://presentation-ready", () => {
-        onPresentOpenChange(true);
-        const d = presentInitRef.current;
-        if (!d?.song) return;
-        emit("karaoke://presentation-init", {
-          song: { title: d.song.title, artist: d.song.artist, album: d.song.album, cover_path: d.song.cover_path, _dir: d.song._dir },
-          lrcLines: d.lrcLines, wordsByLine: d.effectiveWordsByLine,
-        }).catch(() => {});
-        emit("karaoke://presentation-tick", { currentIdx: d.currentIdx, wordIdx: d.wordIdx, wordStatuses: d.wordStatuses }).catch(() => {});
-      });
-    })();
-    return () => unlisten && unlisten();
-  }, [onPresentOpenChange]);
+  useTauriEvent("karaoke://presentation-ready", () => {
+    onPresentOpenChange(true);
+    const d = presentInitRef.current;
+    if (!d?.song) return;
+    emit("karaoke://presentation-init", {
+      song: { title: d.song.title, artist: d.song.artist, album: d.song.album, cover_path: d.song.cover_path, _dir: d.song._dir },
+      lrcLines: d.lrcLines, wordsByLine: d.effectiveWordsByLine,
+    }).catch(() => {});
+    emit("karaoke://presentation-tick", { currentIdx: d.currentIdx, wordIdx: d.wordIdx, wordStatuses: d.wordStatuses }).catch(() => {});
+  });
 
-  useEffect(() => {
-    let unlisten;
-    (async () => {
-      unlisten = await listen("karaoke://presentation-closed", () => onPresentOpenChange(false));
-    })();
-    return () => unlisten && unlisten();
-  }, []);
+  useTauriEvent("karaoke://presentation-closed", () => onPresentOpenChange(false));
 
   // Stream active line/word + score statuses + countdown to the presentation window
   useEffect(() => {
@@ -476,32 +552,15 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     if (synced) {
       const tMs = a.currentTime * 1000;
       const effectiveTMs = tMs - lrcOffset * 1000;
-      let newLine = -1;
-      for (let i = 0; i < lrcLines.length; i++) {
-        const act = lineActivations[i] ?? lrcLines[i].ts_ms;
-        if (act <= effectiveTMs) newLine = i; else break;
-      }
-      let newWord = -1;
-      if (newLine >= 0) {
-        if (effectiveWordsByLine?.[newLine]?.length > 0) {
-          const arr = effectiveWordsByLine[newLine];
-          for (let i = 0; i < arr.length; i++) {
-            if (arr[i].start_ms <= effectiveTMs) newWord = i; else break;
-          }
-        } else {
-          const line = lrcLines[newLine];
-          const words = line.text.trim().split(/\s+/);
-          const lineStart = line.ts_ms;
-          const lineEnd = lrcLines[newLine + 1]?.ts_ms ?? (lineStart + 3000);
-          const elapsed = effectiveTMs - lineStart;
-          const dur = Math.max(1, lineEnd - lineStart);
-          newWord = Math.min(Math.max(Math.floor((elapsed / dur) * words.length), 0), words.length - 1);
-        }
-      }
+      const [newLine, newWord] = computePosition(effectiveTMs);
       setCurrentIdx(newLine);
       setWordIdx(newWord);
     }
   };
+  // Stable handle for the memoized waveform; always calls the latest seek.
+  const seekRef = useRef(seek);
+  seekRef.current = seek;
+  const onSeek = useCallback((pct) => seekRef.current(pct), []);
 
   const calibrationPendingRef = useRef(false);
 
@@ -587,6 +646,8 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
     } catch (e) { console.error("leaderboard save", e); }
     setSessionId(null);
   };
+  const endChallengeRef = useRef(null);
+  endChallengeRef.current = endChallenge;
 
   if (!song) {
     return (
@@ -722,47 +783,21 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
               className="lyrics-scroll">
               <div style={{ height: "40%", flexShrink: 0 }}/>
               {lrcLines.map((line, i) => {
-                const isCurrent = i === currentIdx;
-                const isPast = i < currentIdx;
-                const isAdjacent = i === currentIdx + 1 || i === currentIdx - 1;
-                const fsCurrent = "clamp(32px, 6.5vmin, 120px)";
-                const fsAdjacent = "clamp(18px, 3vmin, 56px)";
-                const fsFar = "clamp(14px, 2.3vmin, 44px)";
+                const relation = lineRelation(i, currentIdx);
+                const isCurrent = relation === "current";
                 const lineWords = (isCurrent && effectiveWordsByLine?.[i]?.length > 0)
                   ? effectiveWordsByLine[i]
                   : null;
                 return (
-                  <div key={i} ref={isCurrent ? activeLineRef : null} style={{
-                    textAlign: "center", padding: "10px 0",
-                    fontFamily: "var(--font-display)",
-                    fontSize: isCurrent ? fsCurrent : isAdjacent ? fsAdjacent : fsFar,
-                    fontWeight: isCurrent ? 700 : 500,
-                    letterSpacing: isCurrent ? "-0.035em" : "-0.02em",
-                    lineHeight: 1.15,
-                    color: isPast ? "rgba(237,233,255,0.25)" : isCurrent ? "#FFF" : (i === currentIdx + 1 ? "rgba(237,233,255,0.35)" : "rgba(237,233,255,0.2)"),
-                    transition: "all 200ms ease",
-                    position: "relative",
-                  }}>
-                    {isCurrent && lineWords ? (
-                      <>
-                        {lineWords.map((w, j) => {
-                          const lit = j < wordIdx;
-                          const active = j === wordIdx;
-                          const scoreStatus = wordStatuses[j];
-                          return (
-                            <span key={j} style={{
-                              display: "inline-block", marginRight: "0.32em",
-                              color: lit ? "#FFF" : active ? "#FF9070" : "rgba(237,233,255,0.35)",
-                              textShadow: lit ? "0 0 24px rgba(255,255,255,0.3)" : active ? "0 0 18px rgba(255,144,112,0.6)" : "none",
-                              transition: "color 200ms ease, text-shadow 200ms ease",
-                              transform: active ? "translateY(-2px)" : "none",
-                              borderBottom: scoreStatus === "hit" ? "2px solid #22D3A4" : scoreStatus === "partial" ? "2px solid #FFB370" : scoreStatus === "miss" ? "2px solid #F23D6D" : "2px solid transparent",
-                            }}>{w.word}</span>
-                          );
-                        })}
-                      </>
-                    ) : line.text}
-                  </div>
+                  <LyricLine
+                    key={i}
+                    text={line.text}
+                    relation={relation}
+                    words={lineWords}
+                    wordIdx={isCurrent ? wordIdx : -1}
+                    wordStatuses={lineWords ? wordStatuses : null}
+                    lineRef={isCurrent ? activeLineRef : null}
+                  />
                 );
               })}
               <div style={{ height: "40%", flexShrink: 0 }}/>
@@ -887,24 +922,7 @@ const Player = forwardRef(function Player({ song, onPlayingChange, presentOpen, 
         </span>
 
         {/* Waveform scrubber */}
-        <div
-          ref={waveformRef}
-          className="waveform"
-          onClick={e => {
-            const rect = e.currentTarget.getBoundingClientRect();
-            seek((e.clientX - rect.left) / rect.width);
-          }}
-          style={{ flex: 1, height: 36, display: "flex", alignItems: "center", gap: 2, cursor: "pointer", position: "relative", "--progress": 0 }}
-        >
-          {bars.map((h, i) => (
-            <div key={i} className="bar" style={{ height: `${h}%` }}/>
-          ))}
-          <div className="waveform-played" aria-hidden="true">
-            {bars.map((h, i) => (
-              <div key={i} className="bar" style={{ height: `${h}%` }}/>
-            ))}
-          </div>
-        </div>
+        <Waveform bars={bars} waveformRef={waveformRef} onSeek={onSeek}/>
 
         <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "rgba(237,233,255,0.6)", minWidth: 34, textAlign: "right", flexShrink: 0 }}>
           {formatTime(duration)}

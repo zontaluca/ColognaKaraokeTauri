@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { createContext, useContext, useMemo, useState } from "react";
+import { useTauriEvent } from "./hooks/useTauriEvent.js";
 
 const CloudContext = createContext({ syncEvents: {} });
 
@@ -7,28 +7,17 @@ export function CloudProvider({ children, onSyncDone }) {
   // song_dir → latest CloudSyncEvent
   const [syncEvents, setSyncEvents] = useState({});
 
-  const handleSyncDone = useCallback(
-    (songDir) => {
-      if (onSyncDone) onSyncDone(songDir);
-    },
-    [onSyncDone]
-  );
+  useTauriEvent("karaoke://cloud-sync", (ev) => {
+    const event = ev.payload;
+    if (!event) return;
+    setSyncEvents((prev) => ({ ...prev, [event.song_dir]: event }));
+    if (event.status === "done" && onSyncDone) onSyncDone(event.song_dir);
+  });
 
-  useEffect(() => {
-    let unlisten;
-    (async () => {
-      unlisten = await listen("karaoke://cloud-sync", (ev) => {
-        const event = ev.payload;
-        if (!event) return;
-        setSyncEvents((prev) => ({ ...prev, [event.song_dir]: event }));
-        if (event.status === "done") handleSyncDone(event.song_dir);
-      });
-    })();
-    return () => unlisten && unlisten();
-  }, [handleSyncDone]);
+  const value = useMemo(() => ({ syncEvents }), [syncEvents]);
 
   return (
-    <CloudContext.Provider value={{ syncEvents }}>
+    <CloudContext.Provider value={value}>
       {children}
     </CloudContext.Provider>
   );

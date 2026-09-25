@@ -76,15 +76,12 @@ async fn run_mega(args: &[&str]) -> Result<String, String> {
 // ─── Connectivity helpers ────────────────────────────────────────────────────
 
 pub async fn is_network_available() -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
+    let Some(client) = crate::http::client() else {
+        return false;
     };
     client
         .get("https://g.api.mega.co.nz/")
+        .timeout(Duration::from_secs(4))
         .send()
         .await
         .map(|r| r.status().is_success() || r.status().as_u16() == 400)
@@ -166,15 +163,16 @@ fn patch_metadata(
 
 // ─── Core operations ─────────────────────────────────────────────────────────
 
+// Artifacts produced by the pipeline (vocals.mp3 + pitch.json are needed by
+// Challenge mode and to reprocess without separating again).
 const SYNC_FILES: &[&str] = &[
     "metadata.json",
     "words.json",
-    "lrc.json",
     "cover.jpg",
     "instrumental.mp3",
     "original.mp3",
-    "vocals.wav",
-    "_pitch_contour.bin",
+    "vocals.mp3",
+    "pitch.json",
 ];
 
 pub async fn upload_song(app: &AppHandle, song_dir: String) -> Result<(), String> {
@@ -344,12 +342,15 @@ pub async fn delete_from_cloud(app: &AppHandle, song_dir: String) -> Result<(), 
 }
 
 pub fn make_cloud_only(song_dir: &str) -> Result<(), String> {
+    // Current artifacts plus legacy names older versions may have left behind.
     const DELETABLE: &[&str] = &[
         "original.mp3",
         "instrumental.mp3",
         "instrumental.wav",
+        "vocals.mp3",
         "vocals.wav",
         "cover.jpg",
+        "pitch.json",
         "_pitch_contour.bin",
         "words.json",
         "lrc.json",
@@ -480,7 +481,7 @@ pub async fn cloud_delete_song(app: AppHandle, dir: String) -> Result<(), String
     delete_from_cloud(&app, dir).await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cloud_make_local_only(dir: String) -> Result<(), String> {
     make_cloud_only(&dir)
 }

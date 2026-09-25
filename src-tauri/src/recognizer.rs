@@ -288,98 +288,6 @@ impl SignatureGenerator {
 }
 
 // ---------------------------------------------------------------------------
-// Audio loading: original.mp3 → f32 mono 16 kHz
-// ---------------------------------------------------------------------------
-
-fn load_audio_mono_16khz(path: &Path) -> Result<Vec<f32>, String> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
-
-    let src = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mss = MediaSourceStream::new(Box::new(src), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
-        .map_err(|e| e.to_string())?;
-
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| {
-            t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL
-        })
-        .ok_or("no audio track found")?
-        .clone();
-
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count())
-        .unwrap_or(1);
-    let track_id = track.id;
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| e.to_string())?;
-
-    let mut mono_samples: Vec<f32> = Vec::new();
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break
-            }
-            Err(symphonia::core::errors::Error::ResetRequired) => {
-                decoder.reset();
-                continue;
-            }
-            Err(e) => return Err(e.to_string()),
-        };
-        if packet.track_id() != track_id {
-            continue;
-        }
-        match decoder.decode(&packet) {
-            Ok(decoded) => {
-                let spec = *decoded.spec();
-                let mut buf =
-                    SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-                buf.copy_interleaved_ref(decoded);
-                let s = buf.samples();
-                for chunk in s.chunks(channels) {
-                    let sum: f32 = chunk.iter().sum();
-                    mono_samples.push(sum / channels as f32);
-                }
-            }
-            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-
-    if mono_samples.is_empty() {
-        return Err("audio decoded to 0 samples".into());
-    }
-
-    // Resample to 16 kHz if needed
-    if sample_rate != 16000 {
-        mono_samples = crate::audio::resample_to(&mono_samples, sample_rate, 16000)?;
-    }
-
-    Ok(mono_samples)
-}
-
-// ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
 
@@ -395,14 +303,13 @@ pub async fn recognize_song(audio_path: &Path) -> Option<SongInfo> {
     let path = audio_path.to_owned();
     // Load + fingerprint in a blocking thread (CPU-intensive)
     let signature = tokio::task::spawn_blocking(move || -> Result<DecodedSignature, String> {
-        let mut samples = load_audio_mono_16khz(&path)?;
-        // Take 12 seconds from the middle (same strategy as SongRec)
-        let target_len = (12 * 16000).min(samples.len());
-        if samples.len() > target_len {
-            let mid = samples.len() / 2;
-            let half = target_len / 2;
-            let start = mid.saturating_sub(half);
-            samples = samples[start..start + target_len].to_vec();
+        // Take 12 seconds from the middle (same strategy as SongRec). The excerpt
+        // is cut at the native rate so only those seconds go through the
+        // resampler, instead of converting the whole song to 16 kHz first.
+        let (excerpt, sample_rate) = crate::audio::load_mono_middle(&path, 12.0)?;
+        let samples = crate::audio::resample_to(&excerpt, sample_rate, 16000)?;
+        if samples.is_empty() {
+            return Err("audio decoded to 0 samples".into());
         }
         Ok(SignatureGenerator::make_signature_from_buffer(&samples))
     })
@@ -455,13 +362,11 @@ async fn query_shazam(
         "timezone": "Europe/Paris"
     });
 
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::http::client().ok_or("HTTP client unavailable")?;
 
     let resp = client
         .post(&url)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
         .header("Content-Language", "en_US")
         .header("Content-Type", "application/json")
         .body(body.to_string())

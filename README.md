@@ -3,17 +3,18 @@
 Desktop karaoke with Spotify-style lyrics, background job queue, SingStar-style
 realtime pitch scoring, and a local SQLite leaderboard. Paste a YouTube URL →
 downloads audio, fetches synced LRC lyrics + album art, separates vocals,
-aligns words via `whisper-rs`, and caches a reference pitch contour.
+aligns words via wav2vec2 CTC forced alignment (ONNX Runtime), and caches a
+reference pitch contour.
 
 All processing is **local** and **offline-capable** after first run. No Python
-dependencies — transcription runs in pure Rust via `whisper-rs` (whisper.cpp).
+dependencies at runtime: alignment runs in Rust through ONNX Runtime (`ort`).
 
 ## Stack
 
 - **Frontend:** React 18 + Vite, plain CSS with token-based design system
 - **Shell:** Tauri 2 (Rust)
 - **Sidecar binaries:** `yt-dlp` (audio download), `demucs` ([demucs-rs](https://github.com/nikhilunni/demucs-rs) native inference)
-- **Rust crates:** `whisper-rs` (word alignment), `cpal` (mic I/O), `pitch-detection` (YIN),
+- **Rust crates:** `ort` + workspace crate `aligner-wav2vec2` (word alignment), `parakeet-rs` (Parakeet TDT v3 ASR), `cpal` (mic I/O), `pitch-detection` (YIN),
   `rusqlite` (leaderboard), `rubato` (resampling), `symphonia` (audio decode), `hound` (WAV)
 - **Lyrics:** [lrclib.net](https://lrclib.net)
 - **Album art:** iTunes Search API, Cover Art Archive fallback
@@ -22,14 +23,13 @@ dependencies — transcription runs in pure Rust via `whisper-rs` (whisper.cpp).
 
 - Node 20+ & pnpm
 - Rust stable toolchain
-- `cmake` (required by `whisper-rs-sys` build script — `brew install cmake` on macOS)
 - `ffmpeg` in `PATH` (yt-dlp mp3 extraction)
 
 ## Setup
 
 ```bash
 pnpm install
-./scripts/fetch-binaries.sh    # yt-dlp + demucs + ggml-tiny.bin (~77 MB)
+./scripts/fetch-binaries.sh    # yt-dlp + demucs + wav2vec2 ONNX model(s) + Parakeet v3 INT8 (~670 MB)
 pnpm tauri dev
 ```
 
@@ -51,8 +51,10 @@ Mic permission is requested on first Challenge-mode play (macOS prompts via `NSM
 1. Fetch LRC lyrics (`lrclib`)
 2. Fetch album art (`iTunes` / `Cover Art Archive`)
 3. Separate vocals (`demucs-rs`)
-4. Align words (`whisper-rs` with LRC as initial prompt) — **mandatory**
-5. Compute reference pitch contour (`pitch-detection` YIN)
+4. Align words (wav2vec2 CTC forced alignment against the lyrics, refined per LRC line) — **mandatory**.
+   Plain lyrics get a generated synced LRC; without lyrics (or without a wav2vec2 model for the
+   language) Parakeet TDT 0.6B v3 transcribes the vocals and the LRC Enhanced is built from it.
+5. Compute reference pitch contour (`pitch-detection` YIN), concurrently with step 4
 6. Save metadata
 
 Progress streams via `karaoke://jobs` events (and legacy `karaoke://progress`).
@@ -86,13 +88,17 @@ Events: `karaoke://jobs`, `karaoke://jobs-list`, `karaoke://score-tick`.
     pipeline.rs aligner.rs audio.rs metadata.rs
     jobs.rs recorder.rs pitch.rs leaderboard.rs
   /binaries      sidecar binaries (not committed)
-  /resources/models/ggml-tiny.bin   whisper model (not committed; fetch via script)
   Info.plist     macOS NSMicrophoneUsageDescription
   entitlements.plist  com.apple.security.device.microphone
+/crates
+  aligner-pipeline   shared alignment types
+  aligner-wav2vec2   wav2vec2 CTC forced aligner (models cached under <cache>/cologna-karaoke/wav2vec2/<lang>/)
 ```
 
 ## Python dependencies
 
-None. The old Python-based alignment (`stable-ts`, `openai-whisper`) was replaced
-by pure Rust `whisper-rs`. `yt-dlp` remains as a pre-built single binary and does
-not require a Python interpreter.
+None at runtime. The old Python-based alignment (`stable-ts`, `openai-whisper`) was
+replaced by the Rust `aligner-wav2vec2` crate. Python is only needed once to export
+wav2vec2 models for languages without a pre-exported ONNX
+(`scripts/export-wav2vec2-onnx.py`). `yt-dlp` remains as a pre-built single binary
+and does not require a Python interpreter.

@@ -2,19 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                c.to_string()
-            } else {
-                let mut buf = [0u8; 4];
-                let bytes = c.encode_utf8(&mut buf).as_bytes().to_vec();
-                bytes.iter().map(|b| format!("%{:02X}", b)).collect::<String>()
-            }
-        })
-        .collect()
-}
+use crate::http::urlencode;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct AlbumMeta {
@@ -31,12 +19,8 @@ pub async fn fetch_album_meta(
     artist: &str,
     song_dir: &Path,
 ) -> AlbumMeta {
-    let client = match reqwest::Client::builder()
-        .user_agent("ColognaKaraoke/0.1 (local app)")
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return AlbumMeta::default(),
+    let Some(client) = crate::http::client() else {
+        return AlbumMeta::default();
     };
 
     // iTunes Search API

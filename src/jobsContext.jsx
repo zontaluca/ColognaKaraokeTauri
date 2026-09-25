@@ -1,6 +1,6 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useTauriEvent } from "./hooks/useTauriEvent.js";
 
 const JobsContext = createContext({
   jobs: [],
@@ -11,47 +11,54 @@ const JobsContext = createContext({
 
 export function JobsProvider({ children, onJobDone }) {
   const [jobs, setJobs] = useState([]);
+  // Last known status per job id: onJobDone fires only on the transition to
+  // "done", not for every event that repeats the final state.
+  const statusRef = useRef(new Map());
 
   useEffect(() => {
-    let unlistenJob, unlistenList;
-    (async () => {
-      try {
-        const initial = await invoke("jobs_list");
-        if (Array.isArray(initial)) setJobs(initial);
-      } catch {}
-      unlistenJob = await listen("karaoke://jobs", (ev) => {
-        const job = ev.payload;
-        if (!job || !job.id) return;
-        setJobs((prev) => {
-          const i = prev.findIndex((j) => j.id === job.id);
-          if (i >= 0) {
-            const next = [...prev];
-            next[i] = job;
-            return next;
-          }
-          return [...prev, job];
-        });
-        if (job.status === "done" && onJobDone) onJobDone(job);
-      });
-      unlistenList = await listen("karaoke://jobs-list", (ev) => {
-        if (Array.isArray(ev.payload)) setJobs(ev.payload);
-      });
-    })();
-    return () => {
-      unlistenJob && unlistenJob();
-      unlistenList && unlistenList();
-    };
-  }, [onJobDone]);
+    invoke("jobs_list")
+      .then((initial) => {
+        if (!Array.isArray(initial)) return;
+        for (const j of initial) statusRef.current.set(j.id, j.status);
+        setJobs(initial);
+      })
+      .catch(() => {});
+  }, []);
 
-  const enqueue = async (url) => {
+  useTauriEvent("karaoke://jobs", (ev) => {
+    const job = ev.payload;
+    if (!job || !job.id) return;
+    setJobs((prev) => {
+      const i = prev.findIndex((j) => j.id === job.id);
+      if (i >= 0) {
+        const next = [...prev];
+        next[i] = job;
+        return next;
+      }
+      return [...prev, job];
+    });
+    const prevStatus = statusRef.current.get(job.id);
+    statusRef.current.set(job.id, job.status);
+    if (job.status === "done" && prevStatus !== "done" && onJobDone) onJobDone(job);
+  });
+
+  useTauriEvent("karaoke://jobs-list", (ev) => {
+    if (!Array.isArray(ev.payload)) return;
+    for (const j of ev.payload) statusRef.current.set(j.id, j.status);
+    setJobs(ev.payload);
+  });
+
+  const enqueue = useCallback(async (url) => {
     return await invoke("jobs_enqueue", { url });
-  };
-  const cancel = async (id) => {
+  }, []);
+  const cancel = useCallback(async (id) => {
     return await invoke("jobs_cancel", { id });
-  };
+  }, []);
+
+  const value = useMemo(() => ({ jobs, enqueue, cancel }), [jobs, enqueue, cancel]);
 
   return (
-    <JobsContext.Provider value={{ jobs, enqueue, cancel }}>
+    <JobsContext.Provider value={value}>
       {children}
     </JobsContext.Provider>
   );

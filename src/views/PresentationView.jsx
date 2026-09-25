@@ -18,6 +18,9 @@ export default function PresentationView() {
 
   useEffect(() => {
     let unInit, unTick, unNext;
+    // listen() resolves asynchronously: if the effect is torn down first (e.g.
+    // React StrictMode), drop the listeners as they arrive instead of leaking them.
+    let disposed = false;
     (async () => {
       unInit = await listen("karaoke://presentation-init", (ev) => {
         const p = ev.payload || {};
@@ -38,9 +41,16 @@ export default function PresentationView() {
       unNext = await listen("karaoke://presentation-next", (ev) => {
         setNextEntry(ev.payload || null);
       });
+      if (disposed) {
+        unInit(); unTick(); unNext();
+        return;
+      }
       emit("karaoke://presentation-ready", {}).catch(() => {});
     })();
-    return () => { if (unInit) unInit(); if (unTick) unTick(); if (unNext) unNext(); };
+    return () => {
+      disposed = true;
+      if (unInit) unInit(); if (unTick) unTick(); if (unNext) unNext();
+    };
   }, []);
 
   useEffect(() => {
@@ -153,7 +163,8 @@ export default function PresentationView() {
                 {isCurrent && lineWords ? lineWords.map((w, j) => {
                   const lit = j < wordIdx;
                   const active = j === wordIdx;
-                  const status = wordStatuses?.[j];
+                  // Score ticks are keyed by the word's index in words.json (gi).
+                  const status = wordStatuses?.[w.gi ?? j];
                   return (
                     <span key={j} style={{
                       display: "inline-block", marginRight: "0.32em",

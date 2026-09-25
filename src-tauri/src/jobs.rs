@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,45 @@ pub struct JobQueue {
 }
 
 pub type JobQueueState = Arc<Mutex<JobQueue>>;
+
+/// True while the queue worker is processing jobs.
+pub fn worker_alive(app: &AppHandle) -> bool {
+    app.try_state::<JobQueueState>()
+        .map_or(false, |s| s.lock().worker_alive)
+}
+
+/// Rate limiter for `karaoke://jobs` progress events. yt-dlp and demucs print
+/// progress many times per second and every event re-renders the frontend.
+/// Stage changes, status changes and new kinds of message (the text with its
+/// numbers removed) always go through; plain percentage ticks are capped.
+struct ProgressThrottle {
+    last_emit: Option<Instant>,
+    last_step: usize,
+    last_kind: String,
+}
+
+impl ProgressThrottle {
+    const MIN_INTERVAL: Duration = Duration::from_millis(200);
+
+    fn new() -> Self {
+        Self { last_emit: None, last_step: usize::MAX, last_kind: String::new() }
+    }
+
+    fn should_emit(&mut self, step: usize, status: &str, message: &str) -> bool {
+        let kind: String = message.chars().filter(|c| !c.is_ascii_digit()).collect();
+        let now = Instant::now();
+        let due = self
+            .last_emit
+            .map_or(true, |t| now.duration_since(t) >= Self::MIN_INTERVAL);
+        let emit = due || status != "active" || step != self.last_step || kind != self.last_kind;
+        if emit {
+            self.last_emit = Some(now);
+            self.last_step = step;
+            self.last_kind = kind;
+        }
+        emit
+    }
+}
 
 fn emit_job(app: &AppHandle, job: &Job) {
     let _ = app.emit("karaoke://jobs", job);
@@ -102,6 +142,10 @@ fn spawn_worker(app: AppHandle, state: JobQueueState) {
                 None => {
                     let mut q = state.lock();
                     q.worker_alive = false;
+                    // Queue drained: free the wav2vec2 session kept between jobs.
+                    // Done under the queue lock so a worker spawned by a new
+                    // enqueue can't have its freshly loaded model dropped.
+                    crate::aligner::release_model_cache();
                     break;
                 }
             };
@@ -138,15 +182,20 @@ fn spawn_worker(app: AppHandle, state: JobQueueState) {
             let app_prog = app.clone();
             let state_prog = state.clone();
             let id_prog = id.clone();
+            let throttle = Arc::new(Mutex::new(ProgressThrottle::new()));
             let on_progress = move |step: usize, status: &str, message: &str, progress: f32| {
                 let mut q = state_prog.lock();
                 if let Some(j) = q.jobs.iter_mut().find(|j| j.id == id_prog) {
                     j.current_step = step;
-                    j.status = if status == "error" { "error".into() } else if status == "done" && progress >= 1.0 { "done".into() } else { "active".into() };
+                    // "done" is set only once the pipeline returns (below), so the
+                    // frontend sees a single done event per job.
+                    j.status = if status == "error" { "error".into() } else { "active".into() };
                     j.message = message.to_string();
                     j.progress = progress;
-                    let j2 = j.clone();
-                    emit_job(&app_prog, &j2);
+                    if throttle.lock().should_emit(step, status, message) {
+                        let j2 = j.clone();
+                        emit_job(&app_prog, &j2);
+                    }
                 }
             };
 
@@ -203,4 +252,21 @@ fn spawn_worker(app: AppHandle, state: JobQueueState) {
 pub fn init(app: &AppHandle) {
     let state: JobQueueState = Arc::new(Mutex::new(JobQueue::default()));
     app.manage(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProgressThrottle;
+
+    #[test]
+    fn throttle_passes_new_stages_and_messages() {
+        let mut t = ProgressThrottle::new();
+        assert!(t.should_emit(0, "active", "Downloading... 1%"));
+        // Same kind of message right away: suppressed.
+        assert!(!t.should_emit(0, "active", "Downloading... 2%"));
+        // Status and message-kind changes always pass.
+        assert!(t.should_emit(0, "done", "Audio downloaded"));
+        assert!(t.should_emit(3, "active", "Separating... 5%"));
+        assert!(t.should_emit(3, "active", "Encoding audio..."));
+    }
 }

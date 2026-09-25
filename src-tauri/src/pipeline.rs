@@ -1,17 +1,18 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use aligner_pipeline::AudioBuffer;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-use crate::aligner::run_alignment;
+use crate::aligner::{alignment_needed, run_alignment};
 use crate::downloader::download_audio;
 use crate::library::{ensure_library, library_dir, save_metadata, song_dir};
 use crate::lyrics::fetch_lyrics;
-use crate::metadata::fetch_album_meta;
-use crate::pitch::precompute_reference_pitch;
+use crate::metadata::{fetch_album_meta, AlbumMeta};
+use crate::pitch::{has_reference_pitch, write_reference_pitch};
 use crate::recognizer::recognize_song;
 use crate::separator::separate_vocals;
-use crate::vad;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StageUpdate {
@@ -19,6 +20,129 @@ pub struct StageUpdate {
     pub status: String,
     pub message: String,
     pub progress: f32,
+}
+
+/// Decode vocals.mp3 once (native rate, mono) on a blocking thread.
+async fn decode_vocals(dir: &Path) -> Result<Arc<AudioBuffer>, String> {
+    let path = dir.join("vocals.mp3");
+    if !path.exists() {
+        return Err("vocals.mp3 not found".into());
+    }
+    let (samples, sample_rate) = tokio::task::spawn_blocking(move || crate::audio::load_wav_mono(&path))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(Arc::new(AudioBuffer { samples, sample_rate }))
+}
+
+/// Steps 4 + 5: word alignment and reference pitch contour. vocals.mp3 is
+/// decoded once and shared by both, and the pitch contour (independent of the
+/// alignment) is computed on its own thread while alignment runs.
+/// Alignment errors are fatal; pitch errors are reported and skipped.
+/// Returns the LRC generated from the word timings (with its source) when
+/// `lrc` was plain text or missing.
+async fn align_and_pitch<F>(
+    dir: &Path,
+    lrc: Option<&str>,
+    on_progress: &mut F,
+    align_start: f32,
+) -> Result<Option<(String, &'static str)>, String>
+where
+    F: FnMut(usize, &str, &str, f32) + Send + Sync + Clone + 'static,
+{
+    on_progress(4, "active", "Aligning words...", align_start);
+
+    let need_words = alignment_needed(dir, lrc);
+    let need_pitch = !has_reference_pitch(dir);
+    let mut decode_error: Option<String> = None;
+    let vocals = if need_words || need_pitch {
+        match decode_vocals(dir).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("[pipeline] vocals decode failed (non-fatal): {}", e);
+                decode_error = Some(e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let pitch_job = if need_pitch {
+        vocals.clone().map(|v| {
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || write_reference_pitch(&dir, &v))
+        })
+    } else {
+        None
+    };
+
+    let phrase_cb = std::sync::Mutex::new(on_progress.clone());
+    let on_phrase = move |done: usize, total: usize| {
+        if total == 0 {
+            return;
+        }
+        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+        let progress = align_start + frac * (0.88 - align_start);
+        let msg = format!("Aligning {}/{}", done, total);
+        if let Ok(mut cb) = phrase_cb.lock() {
+            cb(4, "active", &msg, progress);
+        }
+    };
+    let words_result = run_alignment(dir, lrc, vocals, &on_phrase).await;
+    let generated_lrc = match words_result {
+        Ok(out) => {
+            on_progress(4, "done", "Words aligned", 0.88);
+            let source = out.lrc_source;
+            out.generated_lrc.map(|lrc| (lrc, source))
+        }
+        Err(e) => {
+            on_progress(4, "error", &e, 0.0);
+            return Err(e);
+        }
+    };
+
+    // Step 5 — pitch contour (non-fatal)
+    on_progress(5, "active", "Computing pitch...", 0.90);
+    let pitch_result: Result<(), String> = match pitch_job {
+        Some(job) => job.await.map_err(|e| e.to_string()).and_then(|r| r),
+        None if need_pitch => Err(decode_error.unwrap_or_else(|| "vocals.mp3 not found".into())),
+        None => Ok(()),
+    };
+    match pitch_result {
+        Ok(_) => on_progress(5, "done", "Pitch contour cached", 0.96),
+        Err(e) => on_progress(5, "done", &format!("Pitch skipped: {}", e), 0.96),
+    }
+    Ok(generated_lrc)
+}
+
+/// Store the lyrics in metadata: the generated synced LRC when there is one
+/// (flagged with `lrc_generated`), otherwise the fetched text.
+fn apply_lyrics(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    fetched: Option<String>,
+    generated: Option<(String, &'static str)>,
+) {
+    obj.remove("lrc_generated");
+    match (generated, fetched) {
+        (Some((g, source)), _) => {
+            obj.insert("lrc".into(), g.into());
+            obj.insert("lrc_generated".into(), source.into());
+        }
+        (None, Some(f)) => {
+            obj.insert("lrc".into(), f.into());
+        }
+        (None, None) => {
+            obj.remove("lrc");
+        }
+    }
+}
+
+fn apply_album_meta(obj: &mut serde_json::Map<String, serde_json::Value>, album_meta: AlbumMeta) {
+    if let Some(v) = album_meta.album { obj.insert("album".into(), v.into()); }
+    if let Some(v) = album_meta.album_artist { obj.insert("album_artist".into(), v.into()); }
+    if let Some(v) = album_meta.release_year { obj.insert("release_year".into(), v.into()); }
+    if let Some(v) = album_meta.cover_path { obj.insert("cover_path".into(), v.into()); }
+    if let Some(v) = album_meta.genre { obj.insert("genre".into(), v.into()); }
 }
 
 /// Run full pipeline with progress callback (step, status, message, progress 0-1).
@@ -112,48 +236,8 @@ where
     let _ = std::fs::rename(&download.audio_path, &final_original);
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    // Step 3.5 — vocal activity detection (best-effort; aligner will recompute if needed)
-    on_progress(3, "active", "Detecting vocal activity...", 0.77);
-    match vad::load_or_compute(&final_song_dir) {
-        Ok(iv) => eprintln!(
-            "[pipeline] VAD: {} regions, total_vocal_ms={}",
-            iv.regions.len(),
-            iv.total_vocal_ms()
-        ),
-        Err(e) => eprintln!("[pipeline] VAD failed (non-fatal): {}", e),
-    }
-
-    // Step 4 — align words (mandatory)
-    on_progress(4, "active", "Aligning words...", 0.78);
-    let lrc_for_align = lrc.clone();
-    let phrase_cb = std::sync::Mutex::new(on_progress.clone());
-    let on_phrase = move |done: usize, total: usize| {
-        if total == 0 {
-            return;
-        }
-        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
-        let progress = 0.78 + frac * 0.10;
-        let msg = format!("Aligning {}/{}", done, total);
-        if let Ok(mut cb) = phrase_cb.lock() {
-            cb(4, "active", &msg, progress);
-        }
-    };
-    let words_result =
-        run_alignment(&final_song_dir, lrc_for_align.as_deref(), &on_phrase).await;
-    match &words_result {
-        Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
-        Err(e) => {
-            on_progress(4, "error", e, 0.0);
-            return Err(e.clone());
-        }
-    }
-
-    // Step 5 — pitch contour (non-fatal)
-    on_progress(5, "active", "Computing pitch...", 0.90);
-    match precompute_reference_pitch(&final_song_dir).await {
-        Ok(_) => on_progress(5, "done", "Pitch contour cached", 0.96),
-        Err(e) => on_progress(5, "done", &format!("Pitch skipped: {}", e), 0.96),
-    }
+    // Steps 4 + 5 — align words (mandatory) + pitch contour
+    let generated_lrc = align_and_pitch(&final_song_dir, lrc.as_deref(), &mut on_progress, 0.78).await?;
 
     // Step 6 — save metadata
     on_progress(6, "active", "Saving to library...", 0.97);
@@ -165,17 +249,8 @@ where
         "youtube_title": download.title,
         "youtube_artist": download.artist,
     });
-    if let Some(lrc_text) = lrc {
-        meta.as_object_mut()
-            .unwrap()
-            .insert("lrc".into(), serde_json::Value::String(lrc_text));
-    }
-    let obj = meta.as_object_mut().unwrap();
-    if let Some(v) = album_meta.album { obj.insert("album".into(), v.into()); }
-    if let Some(v) = album_meta.album_artist { obj.insert("album_artist".into(), v.into()); }
-    if let Some(v) = album_meta.release_year { obj.insert("release_year".into(), v.into()); }
-    if let Some(v) = album_meta.cover_path { obj.insert("cover_path".into(), v.into()); }
-    if let Some(v) = album_meta.genre { obj.insert("genre".into(), v.into()); }
+    apply_lyrics(meta.as_object_mut().unwrap(), lrc, generated_lrc);
+    apply_album_meta(meta.as_object_mut().unwrap(), album_meta);
     save_metadata(&final_song_dir, &meta)?;
 
     on_progress(6, "done", "Done!", 1.0);
@@ -237,61 +312,20 @@ where
         on_progress(3, "done", "Vocals already separated", 0.22);
     }
 
-    // Step 3.5 — invalidate VAD cache so it recomputes alongside re-alignment
+    // vad.json is no longer produced: drop the stale copy left by older versions.
     let _ = std::fs::remove_file(dir.join("vad.json"));
-    match vad::load_or_compute(&dir) {
-        Ok(iv) => eprintln!(
-            "[reprocess] VAD: {} regions, total_vocal_ms={}",
-            iv.regions.len(),
-            iv.total_vocal_ms()
-        ),
-        Err(e) => eprintln!("[reprocess] VAD failed (non-fatal): {}", e),
-    }
 
-    // Step 4 — delete words.json, re-align
+    // Steps 4 + 5 — delete words.json / pitch.json, re-align + recompute pitch
     let _ = std::fs::remove_file(dir.join("words.json"));
-    on_progress(4, "active", "Aligning words...", 0.76);
-    let lrc_for_align = lrc.clone();
-    let phrase_cb = std::sync::Mutex::new(on_progress.clone());
-    let on_phrase = move |done: usize, total: usize| {
-        if total == 0 {
-            return;
-        }
-        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
-        let progress = 0.76 + frac * 0.12;
-        let msg = format!("Aligning {}/{}", done, total);
-        if let Ok(mut cb) = phrase_cb.lock() {
-            cb(4, "active", &msg, progress);
-        }
-    };
-    let words_result = run_alignment(&dir, lrc_for_align.as_deref(), &on_phrase).await;
-    match &words_result {
-        Ok(_) => on_progress(4, "done", "Words aligned", 0.88),
-        Err(e) => { on_progress(4, "error", e, 0.0); return Err(e.clone()); }
-    }
-
-    // Step 5 — pitch (force recompute)
     let _ = std::fs::remove_file(dir.join("pitch.json"));
-    on_progress(5, "active", "Computing pitch...", 0.90);
-    match precompute_reference_pitch(&dir).await {
-        Ok(_) => on_progress(5, "done", "Pitch contour cached", 0.96),
-        Err(e) => on_progress(5, "done", &format!("Pitch skipped: {}", e), 0.96),
-    }
+    let generated_lrc = align_and_pitch(&dir, lrc.as_deref(), &mut on_progress, 0.76).await?;
 
     // Step 6 — merge and save metadata
     on_progress(6, "active", "Saving to library...", 0.97);
     let mut meta = existing_meta;
     let obj = meta.as_object_mut().unwrap();
-    if let Some(lrc_text) = lrc {
-        obj.insert("lrc".into(), lrc_text.into());
-    } else {
-        obj.remove("lrc");
-    }
-    if let Some(v) = album_meta.album { obj.insert("album".into(), v.into()); }
-    if let Some(v) = album_meta.album_artist { obj.insert("album_artist".into(), v.into()); }
-    if let Some(v) = album_meta.release_year { obj.insert("release_year".into(), v.into()); }
-    if let Some(v) = album_meta.cover_path { obj.insert("cover_path".into(), v.into()); }
-    if let Some(v) = album_meta.genre { obj.insert("genre".into(), v.into()); }
+    apply_lyrics(obj, lrc, generated_lrc);
+    apply_album_meta(obj, album_meta);
     save_metadata(&dir, &meta)?;
 
     on_progress(6, "done", "Done!", 1.0);
@@ -316,7 +350,12 @@ pub async fn reprocess_song(
             },
         );
     })
-    .await?;
+    .await;
+    // Outside the job queue nobody else will reuse the loaded model soon.
+    if !crate::jobs::worker_alive(&app) {
+        crate::aligner::release_model_cache();
+    }
+    let res = res?;
 
     // Auto-resync to MEGA if configured (force-replace old files with new ones)
     let settings = crate::settings::load_settings(&app);
@@ -340,7 +379,8 @@ pub async fn process_youtube_url(
     url: String,
 ) -> Result<serde_json::Value, String> {
     let app2 = app.clone();
-    run_pipeline(app, url, move |step, status, message, progress| {
+    let app3 = app.clone();
+    let res = run_pipeline(app, url, move |step, status, message, progress| {
         let _ = tauri::Emitter::emit(
             &app2,
             "karaoke://progress",
@@ -352,5 +392,9 @@ pub async fn process_youtube_url(
             },
         );
     })
-    .await
+    .await;
+    if !crate::jobs::worker_alive(&app3) {
+        crate::aligner::release_model_cache();
+    }
+    res
 }

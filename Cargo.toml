@@ -1,3 +1,20 @@
 [workspace]
 members = ["src-tauri", "crates/aligner-pipeline", "crates/aligner-wav2vec2"]
 resolver = "2"
+
+# Release: whole-program optimisation for the DSP-heavy paths (decode,
+# resample, CTC, YIN, fingerprinting).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Dev builds: optimise dependencies (symphonia, rubato, ndarray, pitch-detection,
+# rustfft, ...) so the pipeline in `pnpm tauri dev` isn't an order of magnitude
+# slower than in release. The app crate itself stays unoptimised for fast
+# incremental rebuilds. First dev build takes longer.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Workspace crate with hot numeric loops (CTC Viterbi, log-softmax).
+[profile.dev.package.aligner-wav2vec2]
+opt-level = 2

@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 aligner-pipeline = { path = "../aligner-pipeline" }
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
 ndarray = "0.17"
 hf-hub = { version = "0.5", features = ["tokio"] }
 tokio = { version = "1", features = ["fs", "rt"] }

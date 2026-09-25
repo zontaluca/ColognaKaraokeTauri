@@ -2,10 +2,17 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::http::urlencode;
+
 const LRCLIB_BASE: &str = "https://lrclib.net/api";
 
 static TIMESTAMP_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[(\d{2}):(\d{2})\.(\d{2,3})\]\s*(.*)").unwrap());
+
+// Enhanced-LRC inline word stamps ("<00:12.34>"). Stripped exactly like the
+// frontend's parseLrc so line indices in words.json match the rendered lines.
+static WORD_STAMP_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<\d{2}:\d{2}\.\d{2,3}>").unwrap());
 
 // Strip common YouTube noise: "(Official Video)", "[HD]", "ft. X", etc.
 static YT_NOISE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -39,10 +46,7 @@ pub struct LrcLine {
 }
 
 pub async fn fetch_lyrics(title: &str, artist: &str, duration_sec: Option<u64>) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("ColognaKaraoke/0.1")
-        .build()
-        .ok()?;
+    let client = crate::http::client()?;
 
     // Build candidate title variants: raw → cleaned → stripped of "Artist - " prefix
     let cleaned = clean_title(title);
@@ -128,20 +132,6 @@ pub async fn fetch_lyrics(title: &str, artist: &str, duration_sec: Option<u64>) 
     None
 }
 
-fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                c.to_string()
-            } else {
-                let mut buf = [0u8; 4];
-                let bytes = c.encode_utf8(&mut buf).as_bytes().to_vec();
-                bytes.iter().map(|b| format!("%{:02X}", b)).collect::<String>()
-            }
-        })
-        .collect()
-}
-
 pub fn parse_lrc(text: &str) -> Vec<LrcLine> {
     let mut lines = Vec::new();
     for raw in text.lines() {
@@ -156,7 +146,7 @@ pub fn parse_lrc(text: &str) -> Vec<LrcLine> {
                 centis.parse::<u64>().unwrap_or(0)
             };
             let ts_ms = (m * 60 + s) * 1000 + ms_fraction;
-            let t = c[4].trim().to_string();
+            let t = WORD_STAMP_RE.replace_all(c[4].trim(), "").trim().to_string();
             if !t.is_empty() {
                 lines.push(LrcLine { ts_ms, text: t });
             }
@@ -174,4 +164,18 @@ pub async fn fetch_lyrics_cmd(title: String, artist: String, duration_sec: Optio
 #[tauri::command]
 pub fn parse_lrc_cmd(text: String) -> Vec<LrcLine> {
     parse_lrc(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_lrc;
+
+    #[test]
+    fn strips_inline_word_stamps_and_drops_empty_lines() {
+        let lines = parse_lrc("[00:01.50] <00:01.50>ciao <00:02.00>mondo\n[00:03.00]<00:03.00>\n[00:02.00] prima");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].ts_ms, 1500);
+        assert_eq!(lines[0].text, "ciao mondo");
+        assert_eq!(lines[1].text, "prima");
+    }
 }

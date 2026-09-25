@@ -76,17 +76,38 @@ pub async fn separate_vocals(
 
     on_progress("Encoding audio...", 0.95);
 
-    let (mixed, spec) = mix_wavs_to_memory(&[&drums, &bass, &other])
-        .map_err(|e| format!("Mix failed: {}", e))?;
     let instrumental_path = output_dir.join("instrumental.mp3");
-    encode_stereo_mp3(&mixed, spec.channels, spec.sample_rate, &instrumental_path)
-        .map_err(|e| format!("Instrumental encode failed: {}", e))?;
-
     let vocals_stem = stems_dir.join("vocals.wav");
-    if vocals_stem.exists() {
-        encode_vocals_mp3(&vocals_stem, &output_dir.join("vocals.mp3"))
-            .map_err(|e| format!("Vocals encode failed: {}", e))?;
-    }
+    let vocals_out = output_dir.join("vocals.mp3");
+    let instrumental_out = instrumental_path.clone();
+    // Mixing and MP3 encoding are CPU-bound: run them off the async runtime,
+    // encoding the instrumental and the vocals in parallel on two threads.
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        std::thread::scope(|scope| {
+            let vocals_job = scope.spawn(|| {
+                if vocals_stem.exists() {
+                    encode_vocals_mp3(&vocals_stem, &vocals_out)
+                        .map_err(|e| format!("Vocals encode failed: {}", e))
+                } else {
+                    Ok(())
+                }
+            });
+
+            let instrumental = mix_wavs_to_memory(&[&drums, &bass, &other])
+                .map_err(|e| format!("Mix failed: {}", e))
+                .and_then(|(mixed, spec)| {
+                    encode_stereo_mp3(&mixed, spec.channels, spec.sample_rate, &instrumental_out)
+                        .map_err(|e| format!("Instrumental encode failed: {}", e))
+                });
+            let vocals = vocals_job
+                .join()
+                .unwrap_or_else(|_| Err("Vocals encode thread panicked".into()));
+            instrumental?;
+            vocals
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     let _ = std::fs::remove_dir_all(&stems_dir);
 
@@ -94,20 +115,45 @@ pub async fn separate_vocals(
     Ok(instrumental_path)
 }
 
-/// Mix PCM WAV files of identical format in memory; normalize to prevent clipping.
-fn mix_wavs_to_memory(inputs: &[&Path]) -> Result<(Vec<f32>, hound::WavSpec), String> {
-    use std::io::BufReader;
+/// PCM frames handed to LAME per call: bounds the i16 scratch buffers instead
+/// of converting a whole song up front.
+const ENCODE_CHUNK_FRAMES: usize = 1152 * 64;
 
+fn to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+fn open_wav(path: &Path) -> Result<hound::WavReader<std::io::BufReader<std::fs::File>>, String> {
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    hound::WavReader::new(std::io::BufReader::new(f)).map_err(|e| e.to_string())
+}
+
+/// Iterate a WAV's samples (all channels, interleaved) as f32 in [-1, 1].
+/// Unreadable samples decode as silence, as before.
+fn wav_samples_f32<'a, R: std::io::Read + 'a>(
+    reader: &'a mut hound::WavReader<R>,
+) -> Box<dyn Iterator<Item = f32> + 'a> {
+    let spec = reader.spec();
+    if spec.sample_format == hound::SampleFormat::Float {
+        Box::new(reader.samples::<f32>().map(|s| s.unwrap_or(0.0)))
+    } else {
+        let bits = spec.bits_per_sample as i32;
+        let max = (1i64 << (bits - 1)) as f32;
+        Box::new(reader.samples::<i32>().map(move |s| s.unwrap_or(0) as f32 / max))
+    }
+}
+
+/// Mix PCM WAV files of identical format in memory; normalize to prevent clipping.
+/// Each stem is streamed into a single accumulator, so only the mix is held in
+/// memory (not every stem at once).
+fn mix_wavs_to_memory(inputs: &[&Path]) -> Result<(Vec<f32>, hound::WavSpec), String> {
     if inputs.is_empty() {
         return Err("no inputs".into());
     }
 
     let mut readers: Vec<_> = inputs
         .iter()
-        .map(|p| {
-            let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
-            hound::WavReader::new(BufReader::new(f)).map_err(|e| e.to_string())
-        })
+        .map(|p| open_wav(p))
         .collect::<Result<Vec<_>, _>>()?;
 
     let spec = readers[0].spec();
@@ -117,27 +163,12 @@ fn mix_wavs_to_memory(inputs: &[&Path]) -> Result<(Vec<f32>, hound::WavSpec), St
         }
     }
 
-    let all_samples: Vec<Vec<f32>> = readers
-        .iter_mut()
-        .map(|r| {
-            if spec.sample_format == hound::SampleFormat::Float {
-                r.samples::<f32>()
-                    .map(|s| s.unwrap_or(0.0))
-                    .collect::<Vec<_>>()
-            } else {
-                let bits = spec.bits_per_sample as i32;
-                let max = (1i64 << (bits - 1)) as f32;
-                r.samples::<i32>()
-                    .map(|s| s.unwrap_or(0) as f32 / max)
-                    .collect::<Vec<_>>()
-            }
-        })
-        .collect();
-
-    let len = all_samples.iter().map(|v| v.len()).min().unwrap_or(0);
-    let mut mixed: Vec<f32> = Vec::with_capacity(len);
-    for i in 0..len {
-        mixed.push(all_samples.iter().map(|v| v[i]).sum());
+    let len = readers.iter().map(|r| r.len() as usize).min().unwrap_or(0);
+    let mut mixed: Vec<f32> = vec![0.0; len];
+    for reader in readers.iter_mut() {
+        for (dst, s) in mixed.iter_mut().zip(wav_samples_f32(reader)) {
+            *dst += s;
+        }
     }
 
     let peak = mixed.iter().cloned().map(f32::abs).fold(0.0_f32, f32::max);
@@ -150,48 +181,60 @@ fn mix_wavs_to_memory(inputs: &[&Path]) -> Result<(Vec<f32>, hound::WavSpec), St
     Ok((mixed, spec))
 }
 
+fn build_encoder(
+    channels: u8,
+    sample_rate: u32,
+    bitrate: mp3lame_encoder::Bitrate,
+) -> Result<mp3lame_encoder::Encoder, String> {
+    let mut b = mp3lame_encoder::Builder::new().ok_or("failed to create mp3 builder")?;
+    b.set_num_channels(channels)
+        .map_err(|e| format!("{e:?}"))?;
+    b.set_sample_rate(sample_rate)
+        .map_err(|e| format!("{e:?}"))?;
+    b.set_brate(bitrate)
+        .map_err(|e| format!("{e:?}"))?;
+    b.build().map_err(|e| format!("{e:?}"))
+}
+
 fn encode_stereo_mp3(
     samples: &[f32],
     channels: u16,
     sample_rate: u32,
     out: &Path,
 ) -> Result<(), String> {
-    use mp3lame_encoder::{Bitrate, Builder, DualPcm, FlushNoGap, MonoPcm, max_required_buffer_size};
+    use mp3lame_encoder::{Bitrate, DualPcm, FlushNoGap, MonoPcm, max_required_buffer_size};
 
-    let mut b = Builder::new().ok_or("failed to create mp3 builder")?;
-    b.set_num_channels(channels as u8)
-        .map_err(|e| format!("{e:?}"))?;
-    b.set_sample_rate(sample_rate)
-        .map_err(|e| format!("{e:?}"))?;
-    b.set_brate(Bitrate::Kbps192)
-        .map_err(|e| format!("{e:?}"))?;
-    let mut enc = b.build().map_err(|e| format!("{e:?}"))?;
+    let mut enc = build_encoder(channels as u8, sample_rate, Bitrate::Kbps192)?;
 
-    let n_samples = if channels <= 1 { samples.len() } else { samples.len() / 2 };
+    let ch = channels.max(1) as usize;
+    let n_samples = samples.len() / ch;
     let mut mp3 = Vec::with_capacity(max_required_buffer_size(n_samples) + 7200);
 
-    if channels == 1 {
-        let pcm: Vec<i16> = samples
-            .iter()
-            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .collect();
-        enc.encode_to_vec(MonoPcm(&pcm), &mut mp3)
-            .map_err(|e| format!("{e:?}"))?;
+    if ch == 1 {
+        let mut pcm: Vec<i16> = Vec::with_capacity(ENCODE_CHUNK_FRAMES);
+        for chunk in samples.chunks(ENCODE_CHUNK_FRAMES) {
+            pcm.clear();
+            pcm.extend(chunk.iter().map(|&s| to_i16(s)));
+            mp3.reserve(max_required_buffer_size(pcm.len()));
+            enc.encode_to_vec(MonoPcm(&pcm), &mut mp3)
+                .map_err(|e| format!("{e:?}"))?;
+        }
     } else {
-        let left: Vec<i16> = samples
-            .iter()
-            .step_by(2)
-            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .collect();
-        let right: Vec<i16> = samples
-            .iter()
-            .skip(1)
-            .step_by(2)
-            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .collect();
-        enc.encode_to_vec(DualPcm { left: &left, right: &right }, &mut mp3)
-            .map_err(|e| format!("{e:?}"))?;
+        let mut left: Vec<i16> = Vec::with_capacity(ENCODE_CHUNK_FRAMES);
+        let mut right: Vec<i16> = Vec::with_capacity(ENCODE_CHUNK_FRAMES);
+        for chunk in samples.chunks(ENCODE_CHUNK_FRAMES * ch) {
+            left.clear();
+            right.clear();
+            for frame in chunk.chunks_exact(ch) {
+                left.push(to_i16(frame[0]));
+                right.push(to_i16(frame[1]));
+            }
+            mp3.reserve(max_required_buffer_size(left.len()));
+            enc.encode_to_vec(DualPcm { left: &left, right: &right }, &mut mp3)
+                .map_err(|e| format!("{e:?}"))?;
+        }
     }
+    mp3.reserve(7200);
     enc.flush_to_vec::<FlushNoGap>(&mut mp3)
         .map_err(|e| format!("{e:?}"))?;
     std::fs::write(out, mp3).map_err(|e| e.to_string())?;
@@ -199,56 +242,44 @@ fn encode_stereo_mp3(
 }
 
 /// Read a WAV stem, downmix to mono, encode as 320 kbps MP3.
+/// Streams the stem through a bounded buffer instead of loading it whole.
 fn encode_vocals_mp3(wav_path: &Path, out: &Path) -> Result<(), String> {
-    use std::io::BufReader;
+    use mp3lame_encoder::{Bitrate, FlushNoGap, MonoPcm, max_required_buffer_size};
 
-    use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, MonoPcm, max_required_buffer_size};
-
-    let f = std::fs::File::open(wav_path).map_err(|e| e.to_string())?;
-    let mut reader = hound::WavReader::new(BufReader::new(f)).map_err(|e| e.to_string())?;
+    let mut reader = open_wav(wav_path)?;
     let spec = reader.spec();
-    let channels = spec.channels as usize;
+    let channels = (spec.channels as usize).max(1);
+    let total_frames = reader.duration() as usize;
 
-    let samples_f32: Vec<f32> = if spec.sample_format == hound::SampleFormat::Float {
-        reader
-            .samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
-            .collect()
-    } else {
-        let bits = spec.bits_per_sample as i32;
-        let max = (1i64 << (bits - 1)) as f32;
-        reader
-            .samples::<i32>()
-            .map(|s| s.unwrap_or(0) as f32 / max)
-            .collect()
-    };
+    let mut enc = build_encoder(1, spec.sample_rate, Bitrate::Kbps320)?;
+    let mut mp3 = Vec::with_capacity(max_required_buffer_size(total_frames) + 7200);
 
-    let mono: Vec<i16> = if channels <= 1 {
-        samples_f32
-            .iter()
-            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .collect()
-    } else {
-        samples_f32
-            .chunks(channels)
-            .map(|c| {
-                let avg = c.iter().sum::<f32>() / channels as f32;
-                (avg.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-            })
-            .collect()
-    };
-
-    let mut b = Builder::new().ok_or("failed to create mp3 builder")?;
-    b.set_num_channels(1).map_err(|e| format!("{e:?}"))?;
-    b.set_sample_rate(spec.sample_rate)
-        .map_err(|e| format!("{e:?}"))?;
-    b.set_brate(Bitrate::Kbps320)
-        .map_err(|e| format!("{e:?}"))?;
-    let mut enc = b.build().map_err(|e| format!("{e:?}"))?;
-
-    let mut mp3 = Vec::with_capacity(max_required_buffer_size(mono.len()) + 7200);
-    enc.encode_to_vec(MonoPcm(&mono), &mut mp3)
-        .map_err(|e| format!("{e:?}"))?;
+    let mut mono: Vec<i16> = Vec::with_capacity(ENCODE_CHUNK_FRAMES);
+    let inv = 1.0 / channels as f32;
+    let mut acc = 0.0_f32;
+    let mut in_frame = 0usize;
+    for s in wav_samples_f32(&mut reader) {
+        acc += s;
+        in_frame += 1;
+        if in_frame < channels {
+            continue;
+        }
+        mono.push(to_i16(acc * inv));
+        acc = 0.0;
+        in_frame = 0;
+        if mono.len() == ENCODE_CHUNK_FRAMES {
+            mp3.reserve(max_required_buffer_size(mono.len()));
+            enc.encode_to_vec(MonoPcm(&mono), &mut mp3)
+                .map_err(|e| format!("{e:?}"))?;
+            mono.clear();
+        }
+    }
+    if !mono.is_empty() {
+        mp3.reserve(max_required_buffer_size(mono.len()));
+        enc.encode_to_vec(MonoPcm(&mono), &mut mp3)
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    mp3.reserve(7200);
     enc.flush_to_vec::<FlushNoGap>(&mut mp3)
         .map_err(|e| format!("{e:?}"))?;
     std::fs::write(out, mp3).map_err(|e| e.to_string())?;

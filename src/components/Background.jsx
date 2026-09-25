@@ -6,6 +6,14 @@ import { useEffect, useRef } from "react";
  * - Library/Leaderboard: Threads — soft diagonal streaks.
  * - Others: static radial gradient (respects prefers-reduced-motion).
  */
+// The aurora is made only of soft radial gradients: drawing it at a quarter of
+// the window resolution and letting CSS upscale it is visually identical and
+// costs ~1/16 of the fill rate. Threads are thin strokes and stay at full size.
+const AURORA_SCALE = 0.25;
+const THREADS_SCALE = 1;
+// Both animations drift slowly; 30 fps is indistinguishable from 60/120.
+const FRAME_INTERVAL_MS = 1000 / 30;
+
 export default function Background({ view }) {
   const canvasRef = useRef(null);
 
@@ -14,12 +22,16 @@ export default function Background({ view }) {
     if (!canvas) return;
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const ctx = canvas.getContext("2d");
+    const scale = view === "player" ? AURORA_SCALE : THREADS_SCALE;
     let raf = 0;
+    // Animation time in ms, taken from the rAF clock so the speed no longer
+    // depends on the display refresh rate.
     let t = 0;
+    let lastFrame = 0;
 
     const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      canvas.width = Math.max(1, Math.round(window.innerWidth * scale));
+      canvas.height = Math.max(1, Math.round(window.innerHeight * scale));
     };
     resize();
     window.addEventListener("resize", resize);
@@ -63,22 +75,36 @@ export default function Background({ view }) {
       ctx.globalAlpha = 1;
     };
 
-    const loop = () => {
+    const draw = () => {
       if (view === "player") drawAurora();
       else drawThreads();
-      t += 16;
+    };
+
+    const loop = (now) => {
       raf = requestAnimationFrame(loop);
+      if (now - lastFrame < FRAME_INTERVAL_MS) return;
+      lastFrame = now;
+      t = now;
+      draw();
+    };
+
+    // Stop the loop entirely while the window is hidden/minimized.
+    const onVisibility = () => {
+      cancelAnimationFrame(raf);
+      if (!document.hidden) raf = requestAnimationFrame(loop);
     };
 
     if (reduced) {
-      if (view === "player") drawAurora(); else drawThreads();
+      draw();
     } else {
       raf = requestAnimationFrame(loop);
+      document.addEventListener("visibilitychange", onVisibility);
     }
 
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [view]);
 

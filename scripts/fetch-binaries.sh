@@ -135,5 +135,32 @@ for lang in $W2V_LANGS; do
   fi
 done
 
+# ---- Parakeet TDT 0.6B v3 (multilingual ASR, ONNX) ----
+# Used to transcribe songs without lyrics and to time lyrics when no wav2vec2
+# model fits the language. Layout matches `asr::model_dir()`:
+#   <cache>/cologna-karaoke/parakeet-tdt-0.6b-v3/{encoder,decoder_joint}-model*.onnx + vocab.txt
+PARAKEET_VARIANT="${PARAKEET_VARIANT:-int8}"   # int8 (~670 MB) | fp32 (~2.5 GB) | none
+PARAKEET_DIR="$(dirname "$W2V_CACHE")/parakeet-tdt-0.6b-v3"
+PARAKEET_BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
+case "$PARAKEET_VARIANT" in
+  int8) PARAKEET_FILES="encoder-model.int8.onnx decoder_joint-model.int8.onnx vocab.txt";;
+  fp32) PARAKEET_FILES="encoder-model.onnx encoder-model.onnx.data decoder_joint-model.onnx vocab.txt";;
+  none) PARAKEET_FILES="";;
+  *)    echo "[parakeet] unknown PARAKEET_VARIANT=$PARAKEET_VARIANT (int8|fp32|none)"; exit 1;;
+esac
+if [[ -n "$PARAKEET_FILES" ]]; then
+  mkdir -p "$PARAKEET_DIR"
+  for f in $PARAKEET_FILES; do
+    if [[ -f "$PARAKEET_DIR/$f" ]]; then
+      echo "[parakeet] $f already present — skip"
+      continue
+    fi
+    echo "[parakeet] downloading $f → $PARAKEET_DIR"
+    curl -L --fail -o "$PARAKEET_DIR/$f.part" "$PARAKEET_BASE/$f" \
+      && mv "$PARAKEET_DIR/$f.part" "$PARAKEET_DIR/$f" \
+      || { echo "[parakeet] $f fetch failed"; rm -f "$PARAKEET_DIR/$f.part"; }
+  done
+fi
+
 echo ""
 echo "Done."
